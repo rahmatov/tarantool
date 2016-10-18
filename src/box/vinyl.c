@@ -978,10 +978,14 @@ struct txv {
  * vy_merge_cache forward declarations
  */
 struct vy_merge_cache;
-int
+
+void
 vy_merge_cache_add_tuple(struct vy_merge_cache *cache, struct vy_stmt *prev_stmt,
 		   struct vy_stmt *element_to_cache);
 
+void vy_merge_cache_new(struct vy_index *index);
+
+/* End of vy_merge_cache forward declarations */
 
 typedef rb_tree(struct txv) read_set_t;
 
@@ -3452,6 +3456,13 @@ vy_tx_write(write_set_t *write_set, struct txv *v, ev_tstamp time,
 		}
 		assert(rc == 0); /* TODO: handle BPS tree errors properly */
 		(void) rc;
+
+		/*
+		 * Insert the new statement to the merge
+		 * cache.
+		 */
+		 struct vy_merge_cache *cache = index->cache;
+		 vy_merge_cache_add_tuple(cache, NULL, stmt);
 	}
 	if (range != NULL) {
 		range->update_time = time;
@@ -5084,7 +5095,7 @@ vy_index_new(struct vy_env *e, struct key_def *key_def,
 	index->range_count = 0;
 	index->refs = 0; /* referenced by scheduler */
 	read_set_new(&index->read_set);
-
+	vy_merge_cache_new(index);
 	return index;
 
 error_4:
@@ -7940,22 +7951,50 @@ vy_merge_cached_tuple_init(struct vy_merge_cached_tuple *tuple) {
 	tuple->prev_key = NULL;
 }
 
-int
+void vy_merge_cache_new(struct vy_index *index) {
+	struct vy_merge_cache *cache =  (struct vy_merge_cache *)
+				malloc(sizeof(struct vy_merge_cache));
+	index->cache = cache;
+	cache->index = index;
+	cache_tree_new(&cache->cache_tree);
+}
+
+struct vy_merge_cached_tuple *vy_merge_cache_unref_cb(cache_tree_t *tree,
+				   struct vy_merge_cached_tuple *cached_stmt,
+				   void *op_arg) {
+	(void) op_arg;
+	(void) tree;
+	vy_stmt_unref(cached_stmt->stmt);
+	vy_stmt_unref(cached_stmt->prev_key);
+	return NULL;
+}
+
+void vy_merge_cache_free(struct vy_index *index) {
+	struct vy_merge_cache *cache = index->cache;
+	cache_tree_iter(&cache->cache_tree,
+			NULL,
+			vy_merge_cache_unref_cb,
+			NULL);
+	free(cache);
+}
+
+void
 vy_merge_cache_add_tuple(struct vy_merge_cache *cache, struct vy_stmt *prev_stmt,
 		   struct vy_stmt *element_to_cache) {
 	struct vy_index *index = cache->index;
 	struct vy_merge_cached_tuple *new_tuple = (struct vy_merge_cached_tuple *)
 		malloc(sizeof(struct vy_merge_cached_tuple));
-
 	vy_merge_cached_tuple_init(new_tuple);
 	new_tuple->stmt = element_to_cache;
 	if (prev_stmt) {
-		new_tuple->prev_key = vy_stmt_extract_key_raw(index, prev_stmt->data);
+		new_tuple->prev_key =
+			vy_stmt_extract_key_raw(index, prev_stmt->data);
 	} else {
 		new_tuple->prev_key = NULL;
 	}
+
+	vy_stmt_ref(element_to_cache);;
 	cache_tree_insert(&cache->cache_tree, new_tuple);
-	return 0;
 }
 
 struct vy_merge_cached_tuple *
@@ -8008,8 +8047,7 @@ static struct vy_stmt_iterator_iface vy_cache_iterator_iface;
 static void
 vy_cache_iterator_open(struct vy_cache_iterator *itr,
 		       struct vy_merge_cache *cache,
-		       enum vy_order order, char *key)
-{
+		       enum vy_order order, char *key) {
 	itr->base.iface = &vy_cache_iterator_iface;
 
 	itr->cache = cache;
@@ -9225,8 +9263,9 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct vy_stmt **result)
 	*result = NULL;
 	struct vy_stmt *t = NULL;
 	struct vy_merge_iterator *mi = &itr->merge_iterator;
-	struct vy_stmt *prev_key =
-		vy_stmt_extract_key_raw(itr->index, itr->curr_stmt->data);
+	/* TODO: update cache on iterator next */
+	/*struct vy_stmt *prev_key =
+		vy_stmt_extract_key_raw(itr->index, itr->curr_stmt->data);*/
 	while (true) {
 		if (vy_read_iterator_merge_next_key(itr, &t))
 			return -1;
@@ -9270,7 +9309,7 @@ restart:
 		}
 	}
 	*result = itr->curr_stmt;
-	vy_merge_cache_add_tuple(itr->index->cache, prev_key, itr->curr_stmt);
+	/*vy_merge_cache_add_tuple(itr->index->cache, prev_key, itr->curr_stmt);*/
 	return 0;
 }
 

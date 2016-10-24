@@ -628,7 +628,15 @@ vy_merge_cache_del_stmt(struct vy_merge_cache *cache,
 			 struct vy_stmt *key);
 
 void
-vy_merge_cache_discard(struct vy_merge_cache_quota *quota);
+vy_merge_cache_flush(struct vy_merge_cache_quota *quota);
+
+void
+vy_merge_cache_quota_release(struct vy_merge_cache_quota *quota,
+			     struct vy_merge_cached_stmt *stmt);
+
+int
+vy_merge_cache_quota_lock(struct vy_merge_cache_quota *quota,
+			  struct vy_merge_cached_stmt *stmt);
 
 /* }}} vy_merge_cache forward declarations */
 
@@ -8038,6 +8046,37 @@ vy_merge_cache_free(struct vy_index *index) {
 }
 
 void
+vy_merge_cache_quota_release(struct vy_merge_cache_quota *quota,
+			     struct vy_merge_cached_stmt *stmt) {
+	if (stmt == NULL) {
+		return;
+	}
+
+	if (stmt->prev_key) {
+		quota->used += stmt->prev_key->size;
+	}
+	quota->used += stmt->stmt->size;
+}
+
+int
+vy_merge_cache_quota_lock(struct vy_merge_cache_quota *quota,
+			  struct vy_merge_cached_stmt *stmt) {
+	if (stmt == NULL) {
+		return 0;
+	}
+
+	uint64_t lock_size = stmt->stmt->size;
+	if (stmt->prev_key) {
+		lock_size += stmt->prev_key->size;
+	}
+	if (quota->used < lock_size) {
+		return -1;
+	}
+	quota->used -= lock_size;
+	return 0;
+}
+
+void
 vy_merge_cache_add_stmt(struct vy_merge_cache *cache, struct vy_stmt *prev_stmt,
 		   struct vy_stmt *element_to_cache) {
 	struct vy_index *index = cache->index;
@@ -8059,11 +8098,13 @@ vy_merge_cache_add_stmt(struct vy_merge_cache *cache, struct vy_stmt *prev_stmt,
 	}
 
 	cache_tree_insert(&cache->cache_tree, new_stmt);
+	vy_merge_cache_quota_lock(quota, new_stmt);
 
 	/* update position in lru */
 	rlist_del(&new_stmt->in_lru);
 	rlist_add(&quota->lru_list, &new_stmt->in_lru);
-	vy_merge_cache_discard(quota);
+
+    vy_merge_cache_flush(quota);
 }
 
 struct vy_merge_cached_stmt *
@@ -8093,25 +8134,28 @@ vy_merge_cache_del_stmt_by_ptr(struct vy_merge_cache *cache,
 void
 vy_merge_cache_del_stmt(struct vy_merge_cache *cache,
 			 struct vy_stmt *key) {
+	struct vy_index *index = cache->index;
+	struct vy_merge_cache_quota *quota = index->env->cache_quota;
 	struct vy_merge_cached_stmt *to_delete =
 		vy_merge_cache_get_stmt(cache, key);
 
 	vy_merge_cache_del_stmt_by_ptr(cache, to_delete);
+	vy_merge_cache_quota_release(quota, to_delete);
 }
 
 void
-vy_merge_cache_discard(struct vy_merge_cache_quota *quota) {
-	struct vy_merge_cached_stmt *last;
+vy_merge_cache_flush(struct vy_merge_cache_quota *quota) {
+	struct vy_merge_cached_stmt *last_cached_element;
 	struct rlist *last_entry;
 	while (quota->used > quota->quota) {
 		last_entry = rlist_last(&quota->lru_list);
-		last = container_of(last_entry,
+		last_cached_element = container_of(last_entry,
 				     struct vy_merge_cached_stmt,
 				     in_lru);
-		quota->used -= last->prev_key->size;
-		quota->used -= last->stmt->size;
-		rlist_del(&last->in_lru);
-		vy_merge_cache_del_stmt_by_ptr(last->cache, last);
+	vy_merge_cache_quota_release(quota, last_cached_element);
+	rlist_del(&last_cached_element->in_lru);
+		vy_merge_cache_del_stmt_by_ptr(last_cached_element->cache,
+					       last_cached_element);
 	}
 }
 

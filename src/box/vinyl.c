@@ -8085,11 +8085,11 @@ vy_merge_cache_add_stmt(struct vy_merge_cache *cache, struct vy_stmt *prev_stmt,
 		malloc(sizeof(struct vy_merge_cached_stmt));
 
 	/* TODO: be smarter on update*/
-	vy_merge_cache_del_stmt(cache, element_to_cache);
-
-	vy_merge_cached_stmt_init(cache, new_stmt);
 	vy_stmt_ref(element_to_cache);
+	vy_merge_cache_del_stmt(cache, element_to_cache);
+	vy_merge_cached_stmt_init(cache, new_stmt);
 	new_stmt->stmt = element_to_cache;
+
 	if (prev_stmt) {
 		new_stmt->prev_key =
 			vy_stmt_extract_key_raw(index, prev_stmt->data);
@@ -8104,7 +8104,7 @@ vy_merge_cache_add_stmt(struct vy_merge_cache *cache, struct vy_stmt *prev_stmt,
 	rlist_del(&new_stmt->in_lru);
 	rlist_add(&quota->lru_list, &new_stmt->in_lru);
 
-    vy_merge_cache_flush(quota);
+	vy_merge_cache_flush(quota);
 }
 
 struct vy_merge_cached_stmt *
@@ -8139,8 +8139,8 @@ vy_merge_cache_del_stmt(struct vy_merge_cache *cache,
 	struct vy_merge_cached_stmt *to_delete =
 		vy_merge_cache_get_stmt(cache, key);
 
-	vy_merge_cache_del_stmt_by_ptr(cache, to_delete);
 	vy_merge_cache_quota_release(quota, to_delete);
+	vy_merge_cache_del_stmt_by_ptr(cache, to_delete);
 }
 
 void

@@ -638,6 +638,13 @@ int
 vy_merge_cache_quota_lock(struct vy_merge_cache_quota *quota,
 			  struct vy_merge_cached_stmt *stmt);
 
+int
+vy_merge_cache_get_next_stmt(struct vy_merge_cache *cache,
+			     char *key,
+			     struct vy_stmt *prev_stmt,
+			     enum vy_order order,
+			     struct vy_stmt **result);
+
 /* }}} vy_merge_cache forward declarations */
 
 struct vy_merge_cache_quota {
@@ -8112,9 +8119,77 @@ vy_merge_cache_get_stmt(struct vy_merge_cache *cache, struct vy_stmt *key) {
 	struct vy_merge_cache_key ckey;
 	ckey.data = key->data;
 	ckey.size = key->size;
-	return cache_tree_search(&cache->cache_tree, &ckey);
+	return cache_tree_psearch(&cache->cache_tree, &ckey);
 }
 
+
+/*
+ * Returns next stament in index, if that statement cached.
+ */
+int
+vy_merge_cache_get_next_stmt(struct vy_merge_cache *cache,
+			     char *key,
+			     struct vy_stmt *prev_stmt,
+			     enum vy_order order,
+			     struct vy_stmt **result) {
+	struct vy_index *index = cache->index;
+	struct key_def *key_def = index->key_def;
+	struct vy_merge_cache_key ckey;
+
+	*result = NULL;
+
+	/*
+	 * We do not need infromation about continuation in case of select
+	 * by full key.
+	 * */
+	if (vy_stmt_key_is_full(key, key_def) &&
+			(order == VINYL_GE || order == VINYL_LE)) {
+		struct vy_stmt *key_stmt = vy_stmt_extract_key_raw(index,
+								   key);
+		ckey.data = key_stmt->data;
+		ckey.size = key_stmt->size;
+		struct vy_merge_cached_stmt *cached_stmt =
+			cache_tree_search(&cache->cache_tree, &ckey);
+		if (cached_stmt == NULL) {
+			return -1;
+		}
+		*result = cached_stmt->stmt;
+		vy_stmt_unref(key_stmt);
+		return 0;
+	}
+
+
+	/* TODO: be smarter on the smalest key*/
+	if (prev_stmt == NULL) {
+		return -1;
+	}
+
+	ckey.data = prev_stmt->data;
+	ckey.size = prev_stmt->size;
+	struct vy_merge_cached_stmt *next_stmt_in_cache =
+		cache_tree_nsearch(&cache->cache_tree, &ckey);
+
+	struct vy_stmt *next_stmt = next_stmt_in_cache->stmt;
+	if (next_stmt_in_cache != NULL &&
+		vy_stmt_compare(prev_stmt->data,
+				next_stmt->data,
+				key_def) == 0) {
+		cache_tree_next(&cache->cache_tree, next_stmt_in_cache);
+	}
+
+	/* TODO: be smarter on end of cache */
+	struct vy_stmt *prev_key = next_stmt_in_cache->prev_key;
+	if (next_stmt_in_cache == NULL ||
+		vy_stmt_compare(prev_stmt->data,
+				prev_key->data,
+				key_def) != 0) {
+		/* we have gap in cache and can't return next key */
+		return -1;
+	}
+
+	*result = next_stmt_in_cache->stmt;
+	return 0;
+}
 
 void
 vy_merge_cache_del_stmt_by_ptr(struct vy_merge_cache *cache,
@@ -8159,154 +8234,6 @@ vy_merge_cache_flush(struct vy_merge_cache_quota *quota) {
 	}
 }
 
-/**
- * Iterator over merge cache
- */
-struct vy_cache_iterator {
-	/** Parent class, must be the first member */
-	struct vy_stmt_iterator base;
-
-	/* cache */
-	struct vy_merge_cache *cache;
-
-	/* Search options */
-	/**
-	 * Order, that specifies direction, start position and stop criteria
-	 * if the key is not specified, GT and EQ are changed to
-	 * GE, LT to LE for beauty.
-	 */
-	enum vy_order order;
-
-	/** Search key data in terms of vinyl, vy_stmt_compare argument */
-	char *key;
-
-	/**
-	 * Last stmt returned by vy_run_iterator_get.
-	 * The iterator holds this stmt until the next call to
-	 * vy_run_iterator_get, when it's dereferenced.
-	 */
-	struct vy_stmt *curr_stmt;
-
-	/** Is false until first .._get ot .._next_.. method is called */
-	bool search_started;
-	/** Search is finished, you will not get more values from iterator */
-	bool search_ended;
-};
-
-/** Vtable for vy_stmt_iterator - declared below */
-static struct vy_stmt_iterator_iface vy_cache_iterator_iface;
-
-
-static void
-vy_cache_iterator_open(struct vy_cache_iterator *itr,
-		       struct vy_merge_cache *cache,
-		       enum vy_order order, char *key) {
-	itr->base.iface = &vy_cache_iterator_iface;
-
-	itr->cache = cache;
-	itr->order = order;
-	itr->key = key;
-	if (vy_stmt_key_part(key, 0) == NULL) {
-		/* NULL key. change itr->order for simplification */
-		itr->order = order == VINYL_LT || order == VINYL_LE ?
-			     VINYL_LE : VINYL_GE;
-	}
-
-	itr->curr_stmt = NULL;
-
-	itr->search_started = false;
-	itr->search_ended = false;
-}
-
-
-/**
- *
- * @param itr_ - iterator
- * @return 0 - success
- *         1 - end of continous block
- *         -1 - memory
- */
-static int
-vy_cache_iterator_next_key(struct vy_stmt_iterator *itr_,
-			   struct vy_stmt *prev,
-			   struct vy_stmt **res) {
-	struct vy_cache_iterator *itr = (struct vy_cache_iterator*)itr_;
-	struct key_def *key_def = itr->cache->index->key_def;
-	if (itr->search_ended) {
-		*res = NULL;
-		return 0;
-	}
-	struct vy_merge_cache *cache = itr->cache;
-	enum vy_order order = itr->order;
-
-	struct vy_stmt *curr_stmt;
-	struct vy_merge_cache_key ckey;
-
-	if (!itr->search_started) {
-		curr_stmt = (itr->key ? vy_stmt_extract_key_raw(cache->index,
-						itr->key) : NULL);
-	} else {
-		curr_stmt = prev;
-	}
-	ckey.data = curr_stmt->data;
-	ckey.size = curr_stmt->size;
-
-	struct vy_merge_cached_stmt *cache_el;
-	if (order == VINYL_LE || order == VINYL_LT) {
-		cache_el = cache_tree_nsearch(&cache->cache_tree, &ckey);
-	} else {
-		cache_el = cache_tree_psearch(&cache->cache_tree, &ckey);
-	}
-
-	int cmp = vy_stmt_compare(cache_el->stmt->data, itr->key, key_def);
-	if (cache_el == NULL ||
-		((order == VINYL_LE || VINYL_LT) && cmp < 0) ||
-		(order == VINYL_LT && cmp == 0)) {
-		*res = NULL;
-		itr->search_ended = true;
-		return -1;
-	}
-
-	*res = cache_el->stmt;
-
-	return (vy_stmt_compare(itr->curr_stmt->data,
-				cache_el->prev_key->data,
-				cache->index->key_def));
-}
-static int
-vy_cache_iterator_next_lsn(struct vy_stmt_iterator *itr,
-			   struct vy_stmt *prev,
-			   struct vy_stmt **res) {
-	(void) itr;
-	(void) prev;
-	(void) res;
-	(void) vy_cache_iterator_open;
-	/* There is only one copy of key in cache */
-	unreachable();
-}
-
-static int
-vy_cache_iterator_restore(struct vy_stmt_iterator *itr,
-			   struct vy_stmt *prev,
-			   struct vy_stmt **res) {
-	(void) itr;
-	(void) prev;
-	(void) res;
-	/* Cache is always consistent*/
-	unreachable();
-}
-
-static void
-vy_cache_iterator_close(struct vy_stmt_iterator *itr) {
-	(void) itr;
-}
-
-static struct vy_stmt_iterator_iface vy_cache_iterator_iface = {
-	.next_key = vy_cache_iterator_next_key,
-	.next_lsn = vy_cache_iterator_next_lsn,
-	.restore = vy_cache_iterator_restore,
-	.close = vy_cache_iterator_close
-};
 
 /* }}} Range tree : implementation */
 
@@ -9414,14 +9341,28 @@ static NODISCARD int
 vy_read_iterator_next(struct vy_read_iterator *itr, struct vy_stmt **result)
 {
 	*result = NULL;
-	struct vy_stmt *t = NULL;
-	struct vy_merge_iterator *mi = &itr->merge_iterator;
-	/* TODO: update cache on iterator next */
+	/* look up in cache */
+	struct vy_merge_cache *cache = itr->index->cache;
 	struct vy_stmt *prev_key =
 		(itr->curr_stmt ? vy_stmt_extract_key_raw(itr->index,
 						   itr->curr_stmt->data) :
 						   NULL);
-	struct vy_merge_cache *cache= itr->index->cache;
+	struct vy_stmt *cache_result;
+	int rc = vy_merge_cache_get_next_stmt(cache,
+					      itr->key,
+					      itr->curr_stmt,
+					      itr->order,
+					      &cache_result);
+	if (rc == 0) {
+		*result = itr->curr_stmt = cache_result;
+		return 0;
+	}
+
+	if (prev_key) {
+		vy_stmt_ref(prev_key);
+	}
+	struct vy_stmt *t = NULL;
+	struct vy_merge_iterator *mi = &itr->merge_iterator;
 	while (true) {
 		if (vy_read_iterator_merge_next_key(itr, &t))
 			return -1;
@@ -9467,9 +9408,11 @@ restart:
 	*result = itr->curr_stmt;
 
 	/**
-	 * Add statement, which we read to cache
+	 * Add statement to cache
 	 */
-	vy_merge_cache_add_stmt(cache, prev_key, itr->curr_stmt);
+	if (itr->order == VINYL_GE || itr->order == VINYL_GT) {
+		vy_merge_cache_add_stmt(cache, prev_key, itr->curr_stmt);
+	}
 	/* TODO: reuse prev_key in cache */
 	if (prev_key) {
 		vy_stmt_unref(prev_key);

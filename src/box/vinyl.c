@@ -617,6 +617,7 @@ void vy_merge_cache_free(struct vy_index *index);
 void
 vy_merge_cache_add_stmt(struct vy_merge_cache *cache,
 			 struct vy_stmt *prev_stmt,
+			 struct vy_stmt *next_stmt,
 			 struct vy_stmt *element_to_cache);
 
 void
@@ -644,6 +645,8 @@ vy_merge_cache_get_next_stmt(struct vy_merge_cache *cache,
 			     struct vy_stmt *prev_stmt,
 			     enum vy_order order,
 			     struct vy_stmt **result);
+
+void vy_merge_cache_update_lru(struct vy_merge_cached_stmt *stmt);
 
 /* }}} vy_merge_cache forward declarations */
 
@@ -7965,7 +7968,7 @@ struct vy_merge_cache_key {
 };
 
 struct vy_merge_cached_stmt {
-	struct vy_stmt *prev_key;
+	struct vy_stmt *prev_key, *next_key;
 	struct vy_stmt *stmt;
 	rb_node(struct vy_merge_cached_stmt) in_cache_tree;
 	struct rlist in_lru;
@@ -8011,23 +8014,27 @@ vy_merge_cache_key_cmp(cache_tree_t *rbtree, struct vy_merge_cache_key *a,
 
 void
 vy_merge_cached_stmt_new(struct vy_merge_cache *cache,
-			   struct vy_merge_cached_stmt **stmt) {
+			   struct vy_merge_cached_stmt **stmt)
+{
 	struct vy_merge_cached_stmt *new_stmt = (struct vy_merge_cached_stmt *)
 		malloc(sizeof(struct vy_merge_cached_stmt));
 	*stmt = new_stmt;
 	new_stmt->stmt = NULL;
 	new_stmt->prev_key = NULL;
+	new_stmt->next_key = NULL;
 	new_stmt->cache = cache;
 	rlist_create(&new_stmt->in_lru);
 }
 
 void
-vy_merge_cached_stmt_free(struct vy_merge_cached_stmt *stmt) {
+vy_merge_cached_stmt_free(struct vy_merge_cached_stmt *stmt)
+{
 	free(stmt);
 }
 
 void
-vy_merge_cache_new(struct vy_index *index) {
+vy_merge_cache_new(struct vy_index *index)
+{
 	struct vy_merge_cache *cache =  (struct vy_merge_cache *)
 				malloc(sizeof(struct vy_merge_cache));
 	index->cache = cache;
@@ -8038,12 +8045,16 @@ vy_merge_cache_new(struct vy_index *index) {
 struct vy_merge_cached_stmt
 *vy_merge_cache_unref_cb(cache_tree_t *tree,
 				   struct vy_merge_cached_stmt *cached_stmt,
-				   void *op_arg) {
+				   void *op_arg)
+{
 	struct rlist *free_list = op_arg;
 	(void) tree;
 	vy_stmt_unref(cached_stmt->stmt);
 	if (cached_stmt->prev_key) {
 		vy_stmt_unref(cached_stmt->prev_key);
+	}
+	if (cached_stmt->next_key) {
+		vy_stmt_unref(cached_stmt->next_key);
 	}
 	rlist_del(&cached_stmt->in_lru);
 	rlist_add(free_list, &cached_stmt->in_lru);
@@ -8051,7 +8062,8 @@ struct vy_merge_cached_stmt
 }
 
 void
-vy_merge_cache_free(struct vy_index *index) {
+vy_merge_cache_free(struct vy_index *index)
+{
 	struct vy_merge_cache *cache = index->cache;
 	struct rlist free_list, *in_list;
 	rlist_create(&free_list);
@@ -8074,7 +8086,8 @@ vy_merge_cache_free(struct vy_index *index) {
 
 void
 vy_merge_cache_quota_release(struct vy_merge_cache_quota *quota,
-			     struct vy_merge_cached_stmt *stmt) {
+			     struct vy_merge_cached_stmt *stmt)
+{
 	if (stmt == NULL) {
 		return;
 	}
@@ -8087,7 +8100,8 @@ vy_merge_cache_quota_release(struct vy_merge_cache_quota *quota,
 
 int
 vy_merge_cache_quota_lock(struct vy_merge_cache_quota *quota,
-			  struct vy_merge_cached_stmt *stmt) {
+			  struct vy_merge_cached_stmt *stmt)
+{
 	if (stmt == NULL) {
 		return 0;
 	}
@@ -8096,13 +8110,19 @@ vy_merge_cache_quota_lock(struct vy_merge_cache_quota *quota,
 	if (stmt->prev_key) {
 		lock_size += stmt->prev_key->size;
 	}
+	if (stmt->next_key) {
+		lock_size += stmt->next_key->size;
+	}
 	quota->used += lock_size;
 	return 0;
 }
 
 void
-vy_merge_cache_add_stmt(struct vy_merge_cache *cache, struct vy_stmt *prev_stmt,
-		   struct vy_stmt *element_to_cache) {
+vy_merge_cache_add_stmt(struct vy_merge_cache *cache,
+			struct vy_stmt *prev_stmt,
+			struct vy_stmt *next_stmt,
+			struct vy_stmt *element_to_cache)
+{
 	struct vy_index *index = cache->index;
 	struct vy_merge_cache_quota *quota = index->env->cache_quota;
 	struct vy_merge_cached_stmt *new_stmt;
@@ -8113,25 +8133,30 @@ vy_merge_cache_add_stmt(struct vy_merge_cache *cache, struct vy_stmt *prev_stmt,
 	vy_merge_cache_del_stmt(cache, element_to_cache);
 	new_stmt->stmt = element_to_cache;
 
-	if (prev_stmt) {
+	if (prev_stmt)
 		new_stmt->prev_key =
 			vy_stmt_extract_key_raw(index, prev_stmt->data);
-	} else {
+	else
 		new_stmt->prev_key = NULL;
-	}
+
+	if (next_stmt)
+		new_stmt->next_key =
+			vy_stmt_extract_key_raw(index, next_stmt->data);
+	else
+		new_stmt->next_key = NULL;
 
 	cache_tree_insert(&cache->cache_tree, new_stmt);
 	vy_merge_cache_quota_lock(quota, new_stmt);
 
 	/* update position in lru */
-	rlist_del(&new_stmt->in_lru);
-	rlist_add(&quota->lru_list, &new_stmt->in_lru);
+	vy_merge_cache_update_lru(new_stmt);
 
 	vy_merge_cache_flush(quota);
 }
 
 struct vy_merge_cached_stmt *
-vy_merge_cache_get_stmt(struct vy_merge_cache *cache, struct vy_stmt *key) {
+vy_merge_cache_get_stmt(struct vy_merge_cache *cache, struct vy_stmt *key)
+{
 	struct vy_merge_cache_key ckey;
 	ckey.data = key->data;
 	struct vy_merge_cached_stmt *res =
@@ -8140,54 +8165,26 @@ vy_merge_cache_get_stmt(struct vy_merge_cache *cache, struct vy_stmt *key) {
 }
 
 
-void vy_merge_cache_update_lru(struct vy_merge_cached_stmt *stmt) {
+void vy_merge_cache_update_lru(struct vy_merge_cached_stmt *stmt)
+{
 	struct vy_merge_cache *cache = stmt->cache;
-	struct rlist *lru = cache->quota->lru;
-	rlist_del(stmt->in_lru);
-	rlist_add(lru, stmt->in_lru);
+	struct vy_index *index = cache->index;
+	struct vy_merge_cache_quota *quota = index->env->cache_quota;
+	struct rlist *lru = &quota->lru_list;
+	rlist_del(&stmt->in_lru);
+	rlist_add(lru, &stmt->in_lru);
 }
 
-/*
- * Returns next stament in index, if that statement cached.
- */
 int
-vy_merge_cache_get_next_stmt(struct vy_merge_cache *cache,
-			     char *key,
-			     struct vy_stmt *prev_stmt,
-			     enum vy_order order,
-			     struct vy_stmt **result) {
+vy_merge_cache_get_next_gt(struct vy_merge_cache *cache,
+			       struct vy_stmt *prev_stmt,
+			       struct vy_stmt **result)
+{
 	struct vy_index *index = cache->index;
 	struct key_def *key_def = index->key_def;
 	struct vy_merge_cache_key ckey;
 
 	*result = NULL;
-
-	/* Now cache works only with GE adn GT queries */
-	if (order != VINYL_GE && order != VINYL_GT) {
-		return -1;
-	}
-
-	/*
-	 * We do not need infromation about continuation in case of select
-	 * by full key.
-	 * */
-	if (vy_stmt_key_is_full(key, key_def) && order == VINYL_GE) {
-		ckey.data = key;
-		struct vy_merge_cached_stmt *cached_stmt =
-			cache_tree_search(&cache->cache_tree, &ckey);
-		if (cached_stmt == NULL) {
-			return -1;
-		}
-		*result = cached_stmt->stmt;
-		vy_merge_cache_update_lru(*result);
-		return 0;
-	}
-
-
-	if (prev_stmt == NULL) {
-		return -1;
-	}
-
 	assert(vy_stmt_key_is_full(prev_stmt->data, key_def));
 	ckey.data = prev_stmt->data;
 	struct vy_merge_cached_stmt *next_stmt_in_cache =
@@ -8198,7 +8195,8 @@ vy_merge_cache_get_next_stmt(struct vy_merge_cache *cache,
 		vy_stmt_compare(prev_stmt->data,
 				next_stmt->data,
 				key_def) == 0) {
-		cache_tree_next(&cache->cache_tree, next_stmt_in_cache);
+		next_stmt_in_cache =
+			cache_tree_next(&cache->cache_tree, next_stmt_in_cache);
 	}
 
 	struct vy_stmt *prev_key = next_stmt_in_cache->prev_key;
@@ -8211,30 +8209,123 @@ vy_merge_cache_get_next_stmt(struct vy_merge_cache *cache,
 	}
 
 	*result = next_stmt_in_cache->stmt;
-	vy_merge_cache_update_lru(*result);
+	vy_merge_cache_update_lru(next_stmt_in_cache);
 	return 0;
+}
+
+int
+vy_merge_cache_get_next_lt(struct vy_merge_cache *cache,
+			       struct vy_stmt *prev_stmt,
+			       struct vy_stmt **result)
+{
+	struct vy_index *index = cache->index;
+	struct key_def *key_def = index->key_def;
+	struct vy_merge_cache_key ckey;
+
+	*result = NULL;
+	assert(vy_stmt_key_is_full(prev_stmt->data, key_def));
+	ckey.data = prev_stmt->data;
+	struct vy_merge_cached_stmt *next_stmt_in_cache =
+		cache_tree_psearch(&cache->cache_tree, &ckey);
+
+	struct vy_stmt *next_stmt = next_stmt_in_cache->stmt;
+	if (next_stmt_in_cache != NULL &&
+		vy_stmt_compare(prev_stmt->data,
+				next_stmt->data,
+				key_def) == 0) {
+		next_stmt_in_cache =
+			cache_tree_prev(&cache->cache_tree, next_stmt_in_cache);
+	}
+
+	struct vy_stmt *prev_key = next_stmt_in_cache->next_key;
+	if (next_stmt_in_cache == NULL ||
+		vy_stmt_compare(prev_stmt->data,
+				prev_key->data,
+				key_def) != 0) {
+		/* There is a gap in cache and can't return next key */
+		return -1;
+	}
+
+	*result = next_stmt_in_cache->stmt;
+	vy_merge_cache_update_lru(next_stmt_in_cache);
+	return 0;
+}
+
+/*
+ * Returns next stament in index, if that statement cached.
+ */
+int
+vy_merge_cache_get_next_stmt(struct vy_merge_cache *cache,
+			     char *key,
+			     struct vy_stmt *prev_stmt,
+			     enum vy_order order,
+			     struct vy_stmt **result)
+{
+	struct vy_index *index = cache->index;
+	struct key_def *key_def = index->key_def;
+	struct vy_merge_cache_key ckey;
+
+	*result = NULL;
+
+	/*
+	 * We do not need information about continuation in case of select
+	 * by full key.
+	 * */
+	if (vy_stmt_key_is_full(key, key_def) &&
+			(order == VINYL_GE || order == VINYL_LE)) {
+		ckey.data = key;
+		struct vy_merge_cached_stmt *cached_stmt =
+			cache_tree_search(&cache->cache_tree, &ckey);
+		if (cached_stmt == NULL) {
+			return -1;
+		}
+		*result = cached_stmt->stmt;
+		vy_merge_cache_update_lru(cached_stmt);
+		return 0;
+	}
+
+
+	if (prev_stmt == NULL) {
+		return -1;
+	}
+
+	int rc;
+	if (order == VINYL_GT) {
+		rc = vy_merge_cache_get_next_gt(cache,
+						prev_stmt,
+						result);
+	} else {
+		rc = vy_merge_cache_get_next_lt(cache,
+						prev_stmt,
+						result);
+	}
+
+	return rc;
 }
 
 void
 vy_merge_cache_del_stmt_by_ptr(struct vy_merge_cache *cache,
-			       struct vy_merge_cached_stmt *to_delete) {
+			       struct vy_merge_cached_stmt *to_delete)
+{
 	if (to_delete == NULL) {
 		return;
 	}
-
-	say_warn("Delete stmt %p", to_delete);
 
 	cache_tree_remove(&cache->cache_tree, to_delete);
 	vy_stmt_unref(to_delete->stmt);
 	if (to_delete->prev_key) {
 		vy_stmt_unref(to_delete->prev_key);
 	}
+	if (to_delete->next_key) {
+		vy_stmt_unref(to_delete->next_key);
+	}
 	rlist_del(&to_delete->in_lru);
 }
 
 void
 vy_merge_cache_del_stmt(struct vy_merge_cache *cache,
-			 struct vy_stmt *key) {
+			 struct vy_stmt *key)
+{
 	struct vy_index *index = cache->index;
 	assert(vy_stmt_key_is_full(key->data, index->key_def));
 
@@ -8248,7 +8339,8 @@ vy_merge_cache_del_stmt(struct vy_merge_cache *cache,
 }
 
 void
-vy_merge_cache_flush(struct vy_merge_cache_quota *quota) {
+vy_merge_cache_flush(struct vy_merge_cache_quota *quota)
+{
 	struct vy_merge_cached_stmt *last_cached_element;
 	struct rlist *last_entry;
 	while (quota->used > quota->quota) {
@@ -9440,10 +9532,13 @@ restart:
 	 * Add statement to cache
 	 */
 	if (itr->order == VINYL_GT) {
-		vy_merge_cache_add_stmt(cache, prev_key, itr->curr_stmt);
-	} else if (itr->order == VINYL_GE) {
-		vy_merge_cache_add_stmt(cache, NULL, itr->curr_stmt);
+		vy_merge_cache_add_stmt(cache, prev_key, NULL, itr->curr_stmt);
+	} else if (itr->order == VINYL_LT) {
+		vy_merge_cache_add_stmt(cache, NULL, prev_key, itr->curr_stmt);
+	} else if (itr->order == VINYL_GE || itr->order == VINYL_LE) {
+		vy_merge_cache_add_stmt(cache, NULL, NULL, itr->curr_stmt);
 	}
+
 	/* TODO: reuse prev_key in cache */
 	if (prev_key) {
 		vy_stmt_unref(prev_key);

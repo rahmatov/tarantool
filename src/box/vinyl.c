@@ -8140,6 +8140,13 @@ vy_merge_cache_get_stmt(struct vy_merge_cache *cache, struct vy_stmt *key) {
 }
 
 
+void vy_merge_cache_update_lru(struct vy_merge_cached_stmt *stmt) {
+	struct vy_merge_cache *cache = stmt->cache;
+	struct rlist *lru = cache->quota->lru;
+	rlist_del(stmt->in_lru);
+	rlist_add(lru, stmt->in_lru);
+}
+
 /*
  * Returns next stament in index, if that statement cached.
  */
@@ -8172,6 +8179,7 @@ vy_merge_cache_get_next_stmt(struct vy_merge_cache *cache,
 			return -1;
 		}
 		*result = cached_stmt->stmt;
+		vy_merge_cache_update_lru(*result);
 		return 0;
 	}
 
@@ -8203,6 +8211,7 @@ vy_merge_cache_get_next_stmt(struct vy_merge_cache *cache,
 	}
 
 	*result = next_stmt_in_cache->stmt;
+	vy_merge_cache_update_lru(*result);
 	return 0;
 }
 

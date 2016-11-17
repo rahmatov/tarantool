@@ -666,16 +666,16 @@ lbox_fio_sync(struct lua_State *L)
 	return 1;
 }
 
+#include "backtrace.h"
+
 static int
 lbox_fio_close(struct lua_State *L)
 {
 	int fd = lua_tointeger(L, 1);
+	DUMPFD(fd, "coeio_close");
 	lua_pushboolean(L, coeio_close(fd) == 0);
 	return 1;
 }
-
-
-
 
 void
 tarantool_lua_fio_init(struct lua_State *L)

@@ -55,6 +55,8 @@
 #include <fcntl.h>
 #include <assert.h>
 
+#include "backtrace.h"
+
 /* intptr_t comes from unistd.h, says POSIX/UNIX/tradition */
 /* intptr_t only comes from stdint.h, says idiot openbsd coder */
 #if HAVE_STDINT_H
@@ -1010,7 +1012,7 @@ eio__realpath (struct etp_tmpbuf *tmpbuf, eio_wd wd, const char *path)
         sprintf (tmp1, "/proc/self/fd/%d", fd);
         req->result = readlink (tmp1, res, PATH_MAX);
         /* here we should probably stat the open file and the disk file, to make sure they still match */
-        close (fd);
+        CLOSE (fd);
 
         if (req->result > 0)
           goto done;
@@ -1378,7 +1380,7 @@ eio__scandir (eio_req *req, etp_worker *self)
         dirp = fdopendir (fd);
 
         if (!dirp)
-          close (fd);
+          CLOSE (fd);
       }
     else
       dirp = opendir (req->ptr1);
@@ -1667,7 +1669,7 @@ eio_wd_close_sync (eio_wd wd)
   if (wd != EIO_INVALID_WD && wd != EIO_CWD)
     {
       #if HAVE_AT
-      close (wd->fd);
+      CLOSE (wd->fd);
       #endif
       free (wd);
     }
@@ -1687,7 +1689,7 @@ eio__truncateat (int dirfd, const char *path, off_t length)
     return fd;
 
   res = ftruncate (fd, length);
-  close (fd);
+  CLOSE (fd);
   return res;
 }
 
@@ -1701,7 +1703,7 @@ eio__statvfsat (int dirfd, const char *path, struct statvfs *buf)
     return fd;
 
   res = fstatvfs (fd, buf);
-  close (fd);
+  CLOSE (fd);
   return res;
 
 }
@@ -1938,7 +1940,7 @@ eio_execute (etp_worker *self, eio_req *req)
       case EIO_FCHMOD:    req->result = fchmod    (req->int1, (mode_t)req->int2); break;
       case EIO_FTRUNCATE: req->result = ftruncate (req->int1, req->offs); break;
 
-      case EIO_CLOSE:     req->result = close     (req->int1); break;
+      case EIO_CLOSE:     req->result = CLOSE     (req->int1); break;
       case EIO_DUP2:      req->result = dup2      (req->int1, req->int2); break;
       case EIO_SYNC:      req->result = 0; sync (); break;
       case EIO_FSYNC:     req->result = fsync     (req->int1); break;

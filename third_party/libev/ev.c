@@ -37,6 +37,8 @@
  * either the BSD or the GPL.
  */
 
+#include "backtrace.h"
+
 /* this big block deduces configuration from config.h */
 #ifndef EV_STANDALONE
 # ifdef EV_CONFIG_H
@@ -1434,7 +1436,7 @@ static EV_ATOMIC_T have_monotonic; /* did clock_gettime (CLOCK_MONOTONIC) work? 
 # define EV_WIN32_HANDLE_TO_FD(handle) _open_osfhandle (handle, 0)
 #endif
 #ifndef EV_WIN32_CLOSE_FD
-# define EV_WIN32_CLOSE_FD(fd) close (fd)
+# define EV_WIN32_CLOSE_FD(fd) CLOSE (fd)
 #endif
 
 #ifdef _WIN32
@@ -2280,7 +2282,7 @@ static int evpipe_alloc(EV_P)
       /* so must not be executed on windows */
 
       dup2 (fds [1], evpipe [1]);
-      close (fds [1]);
+      CLOSE (fds [1]);
     }
 
   fd_intern (evpipe [1]);
@@ -2847,16 +2849,16 @@ ev_loop_destroy (EV_P)
 
 #if EV_USE_SIGNALFD
   if (ev_is_active (&sigfd_w))
-    close (sigfd);
+    CLOSE (sigfd);
 #endif
 
 #if EV_USE_INOTIFY
   if (fs_fd >= 0)
-    close (fs_fd);
+    CLOSE (fs_fd);
 #endif
 
   if (backend_fd >= 0)
-    close (backend_fd);
+    CLOSE (backend_fd);
 
 #if EV_USE_IOCP
   if (backend == EVBACKEND_IOCP  ) iocp_destroy   (EV_A);
@@ -4292,7 +4294,7 @@ infy_fork (EV_P)
 
   ev_ref (EV_A);
   ev_io_stop (EV_A_ &fs_w);
-  close (fs_fd);
+  CLOSE (fs_fd);
   fs_fd = infy_newfd ();
 
   if (fs_fd >= 0)

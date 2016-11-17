@@ -44,9 +44,30 @@ backtrace(void *frame, void *stack, size_t stack_size);
 typedef int (backtrace_cb)(int frameno, void *frameret,
                            const char *func, size_t offset, void *cb_ctx);
 
+#include "fio.h"
+#include "sio.h"
+#include "say.h"
+
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
+
+const char *
+backtrace_str(void);
+
+#define DUMPFD(fd, what) ({\
+	say_warn("%s fd=%d, socket='%s' file='%s'", what, fd,			\
+		  sio_socketname(fd), fio_filename(fd));			\
+	say_warn("backtrace for fd=%d:\n%s", fd, backtrace_str());		\
+})
+
+#define CLOSE(fd) ({\
+	DUMPFD(fd, "close");								\
+	int rc = close(fd);							\
+	if (rc < 0)								\
+		say_syserror("close_debug");					\
+	rc;									\
+})
 
 void
 backtrace_foreach(backtrace_cb cb, void *frame, void *stack,

@@ -55,6 +55,7 @@
 #include "iproto_constants.h"
 #include "authentication.h"
 #include "rmean.h"
+#include "backtrace.h"
 
 /* {{{ iproto_msg - declaration */
 
@@ -327,7 +328,7 @@ iproto_connection_close(struct iproto_connection *con)
 		int fd = con->input.fd;
 		/* Make evio_has_fd() happy */
 		con->input.fd = con->output.fd = -1;
-		close(fd);
+		CLOSE(fd);
 		/*
 		 * Discard unparsed data, to recycle the
 		 * connection in net_send_msg() as soon as all

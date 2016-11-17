@@ -27,7 +27,7 @@ ffi.cdef[[
     ssize_t read(int fd, void *buf, size_t count);
     int listen(int fd, int backlog);
     int socket(int domain, int type, int protocol);
-    int close(int s);
+    int lua_socket_close(int s);
     int shutdown(int s, int how);
     ssize_t send(int sockfd, const void *buf, size_t len, int flags);
     ssize_t recv(int s, void *buf, size_t len, int flags);
@@ -71,7 +71,9 @@ local function socket_cdata_gc(socket)
         log.error("socket: attempt to double close on gc")
         return
     end
-    if ffi.C.close(socket.fd) ~= 0 then
+    log.warn("lua socket close on GC: fd=%d", socket.fd)
+    log.warn("backtrace: %s", debug.traceback());
+    if ffi.C.lua_socket_close(socket.fd) ~= 0 then
         log.error("socket: failed to close fd=%d on gc: %s", socket.fd,
             boxerrno.strerror())
     end
@@ -93,7 +95,9 @@ local function bless_socket(fd)
     -- Make socket to be non-blocked by default
     if ffi.C.lbox_socket_nonblock(fd, 1) < 0 then
         local errno = boxerrno()
-        ffi.C.close(fd)
+        log.warn("lua socket close in bless_socket: fd=%d", socket.fd)
+        log.warn("backtrace: %s", debug.traceback());
+        ffi.C.lua_socket_close(fd)
         boxerrno(errno)
         return nil
     end
@@ -334,7 +338,9 @@ socket_methods.close = function(self)
     end
 
     self._errno = nil
-    local r = ffi.C.close(fd)
+    log.warn("lua socket :close() call: fd=%d", self.socket.fd)
+    log.warn("lua backtrace for fd=%d: %s", self.socket.fd, debug.traceback());
+    local r = ffi.C.lua_socket_close(fd)
     self.socket.fd = -1
     ffi.gc(self.socket, nil)
     if r ~= 0 then

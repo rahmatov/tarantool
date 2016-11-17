@@ -38,6 +38,8 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
+#include "backtrace.h"
+
 #include <trivia/util.h>
 
 #define BIND_RETRY_DELAY 0.1
@@ -52,7 +54,7 @@ evio_close(ev_loop *loop, struct ev_io *evio)
 	/* Stop I/O events. Safe to do even if not started. */
 	ev_io_stop(loop, evio);
 	/* Close the socket. */
-	close(evio->fd);
+	CLOSE(evio->fd);
 	/* Make sure evio_has_fd() returns a proper value. */
 	evio->fd = -1;
 }
@@ -187,7 +189,7 @@ evio_service_accept_cb(ev_loop * /* loop */, ev_io *watcher,
 
 		} catch (Exception *e) {
 			if (fd >= 0)
-				close(fd);
+				CLOSE(fd);
 			e->log();
 			return;
 		}
@@ -211,12 +213,12 @@ evio_service_reuse_addr(struct evio_service *service)
 
 	if (unlink(((struct sockaddr_un *)(&service->addr))->sun_path))
 		goto err;
-	close(cl_fd);
+	CLOSE(cl_fd);
 
 	return true;
 err:
 	errno = save_errno;
-	close(cl_fd);
+	CLOSE(cl_fd);
 	return false;
 }
 
@@ -235,7 +237,7 @@ evio_service_bind_addr(struct evio_service *service)
 	int fd = sio_socket(service->addr.sa_family,
 		SOCK_STREAM, IPPROTO_TCP);
 
-	auto fd_guard = make_scoped_guard([=]{ close(fd); });
+	auto fd_guard = make_scoped_guard([=]{ CLOSE(fd); });
 
 	evio_setsockopt_server(fd, service->addr.sa_family, SOCK_STREAM);
 
@@ -394,7 +396,7 @@ evio_service_stop(struct evio_service *service)
 		ev_timer_stop(service->loop, &service->timer);
 	} else {
 		ev_io_stop(service->loop, &service->ev);
-		close(service->ev.fd);
+		CLOSE(service->ev.fd);
 		if (service->addr.sa_family == AF_UNIX) {
 			unlink(((struct sockaddr_un *) &service->addr)->sun_path);
 		}

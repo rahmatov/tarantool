@@ -36,6 +36,8 @@
 #include <unistd.h>
 #include <stdlib.h>
 
+#include "backtrace.h"
+
 static int rfd;
 
 void
@@ -68,7 +70,7 @@ random_free(void)
 {
 	if (rfd == -1)
 		return;
-	close(rfd);
+	CLOSE(rfd);
 }
 
 void

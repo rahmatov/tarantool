@@ -40,7 +40,7 @@
 #include <netinet/in.h>
 #include <netdb.h>
 #include <fcntl.h>
-#include <tarantool_ev.h>
+#include "third_party/tarantool_ev.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -87,6 +87,8 @@ sio_add_to_iov(struct iovec *iov, size_t size)
 	iov->iov_base = (char *) iov->iov_base - size;
 }
 
+const char *sio_socketname(int fd);
+
 #if defined(__cplusplus)
 } /* extern "C" */
 
@@ -114,7 +116,6 @@ private:
 	FDGuard& operator=(const FDGuard&) = delete;
 };
 
-const char *sio_socketname(int fd);
 int sio_socket(int domain, int type, int protocol);
 
 int sio_shutdown(int fd, int how);

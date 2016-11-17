@@ -42,6 +42,7 @@
 #include <limits.h>
 
 #include "say.h"
+#include "backtrace.h"
 
 /** Find a string in an array of strings.
  *
@@ -87,7 +88,7 @@ close_all_xcpt(int fdc, ...)
 			}
 		}
 		if (!found)
-			close(i);
+			CLOSE(i);
 	}
 }
 

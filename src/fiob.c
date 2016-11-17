@@ -48,6 +48,7 @@
 #include <unistd.h>
 #include <trivia/config.h>
 #include <trivia/util.h>
+#include "backtrace.h"
 
 /* Use special implemention if we have O_DIRECT and FOPENCOOKIE or FUNOPEN */
 #if defined(O_DIRECT) && (defined(HAVE_FUNOPEN) || defined(HAVE_FOPENCOOKIE))
@@ -303,7 +304,7 @@ fiob_close(void *cookie)
 	int res = fiob_flushb(f);
 	int save_errno = errno;
 
-	if (close(f->fd) < 0 && res == 0) {
+	if (CLOSE(f->fd) < 0 && res == 0) {
 		res = -1;
 		save_errno = errno;
 	}
@@ -433,7 +434,7 @@ error:
 	save_errno = errno;
 	say_syserror("Can't open '%s'", path);
 	if (fd >= 0)
-		close(fd);
+		CLOSE(fd);
 
 #if defined(FIOB_DIRECT)
 	if (f) {

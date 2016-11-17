@@ -40,6 +40,8 @@
 
 #include "say.h"
 #include "fiber.h"
+#include "sio.h"
+#include "fio.h"
 
 #define CRLF "\n"
 
@@ -328,8 +330,8 @@ backtrace_foreach(backtrace_cb cb, void *frame_, void *stack, size_t stack_size,
 	}
 }
 
-void
-print_backtrace()
+const char *
+backtrace_str(void)
 {
 	void *frame = __builtin_frame_address(0);
 	void *stack_top;
@@ -344,7 +346,12 @@ print_backtrace()
 		stack_size = fiber()->coro.stack_size;
 	}
 
-	fdprintf(STDERR_FILENO, "%s", backtrace(frame, stack_top, stack_size));
+	return backtrace(frame, stack_top, stack_size);
+}
+void
+print_backtrace()
+{
+	fdprintf(STDERR_FILENO, "%s", backtrace_str());
 }
 #endif /* ENABLE_BACKTRACE */
 
@@ -359,4 +366,3 @@ assert_fail(const char *assertion, const char *file, unsigned int line, const ch
 	close_all_xcpt(0);
 	abort();
 }
-

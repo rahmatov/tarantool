@@ -48,6 +48,9 @@ lbox_socket_nonblock(int fh, int mode);
 int bsdsocket_sendto(int fh, const char *host, const char *port,
 		     const void *octets, size_t len, int flags);
 
+int
+lua_socket_close(int fd);
+
 #if defined(__cplusplus)
 } /* extern "C" */
 #endif

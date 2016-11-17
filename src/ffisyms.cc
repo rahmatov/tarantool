@@ -57,6 +57,7 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include "lua/crypto.h"
+#include "lua/socket.h"
 
 /*
  * A special hack to cc/ld to keep symbols in an optimized binary.
@@ -150,5 +151,6 @@ void *ffi_symbols[] = {
 	(void *) tnt_EVP_CIPHER_key_length,
 	(void *) tnt_EVP_CIPHER_iv_length,
 	(void *) tnt_EVP_MD_CTX_new,
-	(void *) tnt_EVP_MD_CTX_free
+	(void *) tnt_EVP_MD_CTX_free,
+	(void *)lua_socket_close
 };

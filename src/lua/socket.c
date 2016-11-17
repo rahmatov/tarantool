@@ -981,3 +981,11 @@ tarantool_lua_socket_init(struct lua_State *L)
 
 	lua_pop(L, 1); /* socket.internal */
 }
+
+#include "backtrace.h"
+
+int
+lua_socket_close(int fd)
+{
+	return CLOSE(fd);
+}

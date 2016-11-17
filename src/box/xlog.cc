@@ -43,6 +43,8 @@
 #include "xrow.h"
 #include "iproto_constants.h"
 
+#include "backtrace.h"
+
 /*
  * marker is MsgPack fixext2
  * +--------+--------+--------+--------+
@@ -657,6 +659,7 @@ xlog_close(struct xlog *l)
 			xlog_sync(l);
 	}
 
+	DUMPFD(fileno(l->f), "fclose");
 	r = fclose(l->f);
 	if (r < 0)
 		say_syserror("%s: close() failed", l->filename);
@@ -678,7 +681,7 @@ xlog_atfork(struct xlog **lptr)
 		 * make its way into the respective file in
 		 * fclose().
 		 */
-		close(fileno(l->f));
+		CLOSE(fileno(l->f));
 		*lptr = NULL;
 	}
 }
@@ -693,7 +696,7 @@ sync_cb(eio_req *req)
 			     fio_filename(fd));
 		errno = 0;
 	}
-	close(fd);
+	CLOSE(fd);
 	return 0;
 }
 
@@ -843,6 +846,8 @@ xlog_open_stream(struct xdir *dir, int64_t signature, FILE *file,
 	struct xlog *l = (struct xlog *) calloc(1, sizeof(*l));
 
 	auto log_guard = make_scoped_guard([=]{
+		DUMPFD(fileno(file), "fclose");
+		say_warn("xlog_open_stream fclose fd=%d", fileno(file));
 		fclose(file);
 		free(l);
 	});
@@ -961,6 +966,9 @@ error:
 	int save_errno = errno;
 	say_syserror("%s: failed to open", filename);
 	if (f != NULL) {
+		DUMPFD(fileno(f), "fclose");
+		say_warn("xlog create close on error: fd=%d filename=%s",
+			  fileno(f), filename);
 		fclose(f);
 		unlink(filename); /* try to remove incomplete file */
 	}

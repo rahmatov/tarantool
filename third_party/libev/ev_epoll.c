@@ -270,7 +270,7 @@ epoll_destroy (EV_P)
 void inline_size
 epoll_fork (EV_P)
 {
-  close (backend_fd);
+  CLOSE (backend_fd);
 
   while ((backend_fd = epoll_create (256)) < 0)
     ev_syserr ("(libev) epoll_create");

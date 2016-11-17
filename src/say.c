@@ -43,6 +43,7 @@
 #include <syslog.h>
 
 #include "fiber.h"
+#include "backtrace.h"
 
 pid_t logger_pid = 0;
 int log_level = S_INFO;
@@ -160,7 +161,7 @@ say_pipe_init(const char *init_str)
 	if (logger_pid == 0) {
 		sigprocmask(SIG_UNBLOCK, &mask, NULL);
 
-		close(pipefd[1]);
+		CLOSE(pipefd[1]);
 		dup2(pipefd[0], STDIN_FILENO);
 		/*
 		 * Move to an own process group, to not
@@ -189,7 +190,7 @@ say_pipe_init(const char *init_str)
 #endif
 	/* OK, let's hope for the best. */
 	sigprocmask(SIG_UNBLOCK, &mask, NULL);
-	close(pipefd[0]);
+	CLOSE(pipefd[0]);
 	log_fd = pipefd[1];
 	say_info("started logging into a pipe, SIGHUP log rotation disabled");
 	logger_type = SAY_LOGGER_PIPE;
@@ -216,7 +217,7 @@ say_logrotate(int signo)
 	/* The whole charade's purpose is to avoid log_fd changing.
 	 * Remember, we are a signal handler.*/
 	dup2(fd, log_fd);
-	close(fd);
+	CLOSE(fd);
 
 	if (logger_background) {
 		dup2(log_fd, STDOUT_FILENO);
@@ -320,7 +321,7 @@ say_logger_init(const char *init_str, int level, int nonblock, int background)
 			int fd = open("/dev/null", O_WRONLY);
 			dup2(fd, STDERR_FILENO);
 			dup2(fd, STDOUT_FILENO);
-			close(fd);
+			CLOSE(fd);
 		} else {
 			dup2(log_fd, STDERR_FILENO);
 			dup2(log_fd, STDOUT_FILENO);

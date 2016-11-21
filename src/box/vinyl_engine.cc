@@ -128,7 +128,13 @@ VinylEngine::buildSecondaryKey(struct space *old_space,
 {
 	(void)old_space;
 	(void)new_space;
-	VinylIndex *new_index = (VinylIndex *) new_index_arg;
+	VinylSecondaryIndex *new_index = (VinylSecondaryIndex *) new_index_arg;
+	VinylPrimaryIndex *old_pk, *new_pk;
+	/* Get the vinyl primary index from the old VinylPrimaryIndex object. */
+	old_pk = (VinylPrimaryIndex *) index_find_unique(old_space, 0);
+	new_pk = (VinylPrimaryIndex *) index_find_unique(new_space, 0);
+	new_pk->db = old_pk->db;
+
 	new_index->open();
 	/* Unlike Memtx, Vinyl does not need building of a secondary index.
 	 * This is true because of two things:

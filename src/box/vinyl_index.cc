@@ -138,7 +138,7 @@ VinylPrimaryIndex::open()
 {
 	assert(db == NULL);
 	/* Create vinyl database. */
-	db = vy_index_new(env, key_def);
+	db = vy_index_new_primary(env, key_def);
 	if (db == NULL || vy_index_open(db))
 		diag_raise();
 }
@@ -146,107 +146,25 @@ VinylPrimaryIndex::open()
 VinylSecondaryIndex::VinylSecondaryIndex(struct vy_env *env_arg,
 					 VinylPrimaryIndex *pk_arg,
 					 struct key_def *key_def_arg)
-	:VinylIndex(env_arg, key_def_arg)
-	 ,key_def_tuple_to_key(NULL)
-	 ,key_def_secondary_to_primary(NULL)
-	 ,column_mask(0)
-	 ,primary_index(pk_arg)
-{
-	/* Calculate the bitmask of columns used in this index. */
-	for (uint32_t i = 0; i < key_def->part_count; ++i) {
-		uint32_t fieldno = key_def->parts[i].fieldno;
-		if (fieldno >= 64) {
-			column_mask = UINT64_MAX;
-			break;
-		}
-		column_mask |= ((uint64_t)1) << (63 - fieldno);
-	}
-}
-
-/**
- * Get tuple from the primary index by the partial tuple from secondary index.
- */
-static struct tuple *
-lookup_full_tuple(const VinylSecondaryIndex *index, struct tuple *tuple,
-		  struct vy_tx *tx)
-{
-	assert(index->key_def->iid != 0);
-	const char *primary_key;
-	/* Fetch the primary key from the secondary index tuple. */
-	struct key_def *def = index->key_def_secondary_to_primary;
-	primary_key = tuple_extract_key(tuple, def, NULL);
-	/* Fetch the tuple from the primary index. */
-	mp_decode_array(&primary_key); /* Skip array header. */
-	if (vy_get(tx, index->primary_index->db, primary_key,
-		   def->part_count, &tuple) != 0) {
-
-		diag_raise();
-	}
-	return tuple;
-}
-
-struct tuple*
-VinylSecondaryIndex::findByKey(const char *key, uint32_t part_count) const
-{
-	struct tuple *tuple = VinylIndex::findByKey(key, part_count);
-	if (tuple) {
-		struct vy_tx *transaction = in_txn() ?
-			(struct vy_tx *) in_txn()->engine_tx : NULL;
-		/*
-		 * A secondary index does not store all tuple fields, but
-		 * only the fields participating in the index and the fields
-		 * of the primary key. Fetch the full tuple in the primary
-		 * index.
-		 */
-		return lookup_full_tuple(this, tuple, transaction);
-	}
-	return NULL;
-}
+	:VinylIndex(env_arg, key_def_arg), primary_index(pk_arg)
+{}
 
 void
 VinylSecondaryIndex::open()
 {
 	assert(db == NULL);
-	key_def_tuple_to_key = key_def_merge(key_def, primary_index->key_def);
-
-	key_def_secondary_to_primary =
-		key_def_build_secondary_to_primary(primary_index->key_def, key_def);
-
-	/**
-	 * key_def_vinyl is a merged key_def of this index and key_def
-	 * of the primary index, in which parts field number are
-	 * renumbered.
-	 *
-	 * For instance:
-	 * - merged primary and secondary: 3 (str), 6 (uint), 4 (scalar)
-	 * - key_def_vinyl:                0 (str), 1 (uint), 2 (scalar)
-	 *
-	 * Condensing is necessary since partial tuple consists only
-	 * from primary secondary key fields, coalesced.
-	 */
-	struct key_def *key_def_vinyl;
-	key_def_vinyl = key_def_build_secondary(primary_index->key_def, key_def);
-	/* The engine makes a copy of the key. */
-	auto guard = make_scoped_guard([=]{key_def_delete(key_def_vinyl);});
-	/* Create a vinyl index. */
-	db = vy_index_new(env, key_def_vinyl);
+	assert(primary_index != NULL);
+	assert(primary_index->db != NULL);
+	db = vy_index_new_secondary(env, key_def, primary_index->db);
 	if (db == NULL || vy_index_open(db))
 		diag_raise();
-}
-
-VinylSecondaryIndex::~VinylSecondaryIndex()
-{
-	if (key_def_tuple_to_key)
-		key_def_delete(key_def_tuple_to_key);
-	if (key_def_secondary_to_primary)
-		key_def_delete(key_def_secondary_to_primary);
 }
 
 struct tuple *
 VinylIndex::iterator_next(struct vy_tx *tx, struct vinyl_iterator *it) const
 {
 	(void) tx;
-	struct tuple *tuple;
+	struct tuple *tuple = NULL;
 	uint32_t it_sc_version = ::sc_version;
 	if (it_sc_version != ::sc_version)
 		goto close;
@@ -261,16 +179,6 @@ close:
 	vy_cursor_delete(it->cursor);
 	it->cursor = NULL;
 	it->base.next = NULL;
-	return NULL;
-}
-
-struct tuple *
-VinylSecondaryIndex::iterator_next(struct vy_tx *tx,
-				   struct vinyl_iterator *it) const
-{
-	struct tuple *tuple = VinylIndex::iterator_next(tx, it);
-	if (tuple)
-		return lookup_full_tuple(this, tuple, tx);
 	return NULL;
 }
 

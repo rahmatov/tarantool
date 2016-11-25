@@ -40,6 +40,7 @@
 #include <small/rb.h>
 #include <small/mempool.h>
 #include <small/region.h>
+#include <small/lsregion.h>
 #include <msgpuck/msgpuck.h>
 #include <coeio_file.h>
 
@@ -117,10 +118,12 @@ struct vy_env {
 	struct vy_stat      *stat;
 	/** Mempool for struct vy_cursor */
 	struct mempool      cursor_pool;
-	/** Mempool for matras extents in vy_mem */
-	struct mempool      mem_tree_extent_pool;
 	/** Mempool for struct vy_page_read_task */
 	struct mempool      read_task_pool;
+	/** Mempool for matras extents in vy_mem */
+	struct mempool      mem_tree_extent_pool;
+	/** Allocator for tuples */
+	struct lsregion     allocator;
 	/** Key for thread-local ZSTD context */
 	pthread_key_t       zdctx_key;
 	/** Timer for updating quota watermark. */
@@ -3849,9 +3852,10 @@ vy_range_set(struct vy_range *range, const struct vy_stmt *stmt,
 	struct vy_mem *mem = rlist_first_entry(&range->mems,
 					       struct vy_mem, link);
 	size_t size = vy_stmt_size(stmt);
-	struct vy_stmt *mem_stmt = region_alloc(&mem->region, size);
+	struct vy_stmt *mem_stmt = lsregion_alloc(&index->env->allocator, size,
+						  stmt->lsn);
 	if (mem_stmt == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc", "mem_stmt");
+		diag_set(OutOfMemory, size, "lsregion_alloc", "mem_stmt");
 		return -1;
 	}
 	memcpy(mem_stmt, stmt, size);
@@ -5028,6 +5032,9 @@ vy_scheduler_mem_dumped(struct vy_scheduler *scheduler, struct vy_mem *mem)
 	} else {
 		scheduler->mem_min_lsn = INT64_MAX;
 	}
+
+	struct lsregion *allocator = &scheduler->env->allocator;
+	lsregion_gc(allocator, scheduler->mem_min_lsn);
 
 	if (scheduler->mem_min_lsn > scheduler->checkpoint_lsn) {
 		/*
@@ -6768,12 +6775,14 @@ vy_env_new(void)
 	if (e->scheduler == NULL)
 		goto error_sched;
 
-	mempool_create(&e->cursor_pool, cord_slab_cache(),
+	struct slab_cache *slab_cache = cord_slab_cache();
+	mempool_create(&e->cursor_pool, slab_cache,
 	               sizeof(struct vy_cursor));
-	mempool_create(&e->mem_tree_extent_pool, cord_slab_cache(),
-		       VY_MEM_TREE_EXTENT_SIZE);
-	mempool_create(&e->read_task_pool, cord_slab_cache(),
+	mempool_create(&e->read_task_pool, slab_cache,
 		       sizeof(struct vy_page_read_task));
+	mempool_create(&e->mem_tree_extent_pool, slab_cache,
+		       VY_MEM_TREE_EXTENT_SIZE);
+	lsregion_create(&e->allocator, slab_cache->arena);
 	tt_pthread_key_create(&e->zdctx_key, vy_free_zdctx);
 
 	ev_timer_init(&e->quota_timer, vy_env_quota_timer_cb, 0, 1.);
@@ -6805,8 +6814,9 @@ vy_env_delete(struct vy_env *e)
 	vy_quota_delete(e->quota);
 	vy_stat_delete(e->stat);
 	mempool_destroy(&e->cursor_pool);
-	mempool_destroy(&e->mem_tree_extent_pool);
 	mempool_destroy(&e->read_task_pool);
+	mempool_destroy(&e->mem_tree_extent_pool);
+	lsregion_destroy(&e->allocator);
 	tt_pthread_key_delete(e->zdctx_key);
 	free(e);
 }

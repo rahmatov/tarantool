@@ -40,6 +40,7 @@
 #include <small/rb.h>
 #include <small/mempool.h>
 #include <small/region.h>
+#include <small/lsregion.h>
 #include <msgpuck/msgpuck.h>
 #include <coeio_file.h>
 
@@ -112,6 +113,7 @@ struct vy_env {
 	struct mempool      mem_tree_extent_pool;
 	/** Timer for updating quota watermark. */
 	ev_timer            quota_timer;
+	struct lsregion allocator;
 };
 
 struct vy_buf {
@@ -3643,9 +3645,10 @@ vy_range_set(struct vy_range *range, const struct vy_stmt *stmt,
 	struct vy_mem *mem = rlist_first_entry(&range->mems,
 					       struct vy_mem, link);
 	size_t size = vy_stmt_size(stmt);
-	struct vy_stmt *mem_stmt = region_alloc(&mem->region, size);
+	struct vy_stmt *mem_stmt = lsregion_alloc(&index->env->allocator, size,
+						  stmt->lsn);
 	if (mem_stmt == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc", "mem_stmt");
+		diag_set(OutOfMemory, size, "lsregion_alloc", "mem_stmt");
 		return -1;
 	}
 	memcpy(mem_stmt, stmt, size);
@@ -3738,10 +3741,15 @@ vy_range_set_upsert(struct vy_range *range, struct vy_stmt *stmt,
 		 *
 		 */
 		assert(older == NULL || older->type != IPROTO_UPSERT);
-		stmt = vy_apply_upsert(stmt, older, key_def, index->format,
-				       false);
-		if (stmt == NULL)
+		struct vy_stmt *newest = vy_apply_upsert(stmt, older, key_def,
+							 index->format, false);
+		if (newest == NULL)
 			return -1; /* OOM */
+		if (newest->lsn != stmt->lsn) {
+			vy_stmt_unref(newest);
+			return 0;
+		}
+		stmt = newest;
 		assert(stmt->type == IPROTO_REPLACE);
 		int rc = vy_range_set(range, stmt, write_size);
 		vy_stmt_unref(stmt);
@@ -4693,6 +4701,9 @@ vy_scheduler_mem_dumped(struct vy_scheduler *scheduler, struct vy_mem *mem)
 	} else {
 		scheduler->mem_min_lsn = INT64_MAX;
 	}
+
+	struct lsregion *allocator = &scheduler->env->allocator;
+	lsregion_gc(allocator, scheduler->mem_min_lsn);
 
 	if (scheduler->mem_min_lsn > scheduler->checkpoint_lsn) {
 		/*
@@ -6294,10 +6305,11 @@ vy_env_new(void)
 	if (e->scheduler == NULL)
 		goto error_sched;
 
-	mempool_create(&e->cursor_pool, cord_slab_cache(),
-	               sizeof(struct vy_cursor));
-	mempool_create(&e->mem_tree_extent_pool, cord_slab_cache(),
-		       VY_MEM_TREE_EXTENT_SIZE);
+	struct slab_cache *cache = cord_slab_cache();
+	mempool_create(&e->cursor_pool, cache, sizeof(struct vy_cursor));
+	mempool_create(&e->mem_tree_extent_pool, cache,
+		      VY_MEM_TREE_EXTENT_SIZE);
+	lsregion_create(&e->allocator, cache->arena);
 
 	ev_timer_init(&e->quota_timer, vy_env_quota_timer_cb, 0, 1.);
 	e->quota_timer.data = e;
@@ -6329,6 +6341,7 @@ vy_env_delete(struct vy_env *e)
 	vy_stat_delete(e->stat);
 	mempool_destroy(&e->cursor_pool);
 	mempool_destroy(&e->mem_tree_extent_pool);
+	lsregion_destroy(&e->allocator);
 	free(e);
 }
 

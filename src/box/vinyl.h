@@ -47,6 +47,7 @@ struct vy_env;
 struct vy_tx;
 struct vy_cursor;
 struct vy_index;
+struct vy_space;
 struct key_def;
 struct tuple;
 struct tuple_format;
@@ -122,22 +123,112 @@ vy_info_gather(struct vy_env *env, struct vy_info_handler *h);
 struct vy_tx *
 vy_begin(struct vy_env *e);
 
+/**
+ * Get a tuple from a vinyl space.
+ * @param tx          Current transaction.
+ * @param index       Vinyl index.
+ * @param key         MessagePack'ed data, the array without a
+ *                    header.
+ * @param part_count  Part count of the key.
+ * @param[out] result Is set to the the found tuple.
+ *
+ * @retval  0 Success.
+ * @retval -1 Memory error.
+ */
 int
 vy_get(struct vy_tx *tx, struct vy_index *index,
        const char *key, uint32_t part_count, struct tuple **result);
 
+/**
+ * Execute REPLACE in the space.
+ * @param tx             Current transaction.
+ * @param space          Space in which replace.
+ * @param tuple          MessagePack array.
+ * @param tuple_end      End of the \p tuple.
+ * @param[out] old_tuple If not NULL then is set to the replaced
+ *                       statement.
+ *
+ * @retval  0 Success.
+ * @retval -1 Error.
+ */
 int
-vy_replace(struct vy_tx *tx, struct vy_index *index,
-	   const char *tuple, const char *tuple_end);
+vy_replace(struct vy_tx *tx, struct vy_space *space,
+	   const char *tuple, const char *tuple_end, struct tuple **old_tuple);
 
+/**
+ * Execute INSERT in the space.
+ * @param tx        Current transaction.
+ * @param space     Space in which insert.
+ * @param tuple     MessagePack array.
+ * @param tuple_end End of the \p tuple.
+ *
+ * @retval  0 Success.
+ * @retval -1 Error.
+ */
 int
-vy_upsert(struct vy_tx *tx, struct vy_index *index,
+vy_insert(struct vy_tx *tx, struct vy_space *space,
+	  const char *tuple, const char *tuple_end);
+
+/**
+ * Execute UPDATE in the space by the specified index.
+ * @param tx             Current transaction.
+ * @param index          Vinyl index.
+ * @param key            MessagePack'ed data, the array without a
+ *                       header.
+ * @param part_count     Part count of the key.
+ * @param ops            MessagePack array of update operations.
+ * @param ops_end        End of the operations array.
+ * @param index_base     Index base.
+ * @param[out] old_tuple Is set to the old statement.
+ * @param[out] new_tuple Is set to the new statement.
+ *
+ * @retval  0 Success.
+ * @retval -1 Error.
+ */
+int
+vy_update(struct vy_tx *tx, struct vy_index *index,
+	  const char *key, uint32_t part_count,
+	  const char *ops, const char *ops_end, int index_base,
+	  struct tuple **old_tuple, struct tuple **new_tuple);
+
+/**
+ * Execute UPSERT in the space.
+ * @param tx             Current transaction.
+ * @param space          Space in which upsert.
+ * @param tuple          MessagePack array.
+ * @param tuple_end      End of the \p tuple.
+ * @param ops            MessagePack array of update operations.
+ * @param ops_end        End of the operations array.
+ * @param[out] old_tuple If not NULL then is set to the old
+ *                       statement.
+ * @param[out] new_tuple If not NULL then is set to the new
+ *                       statement.
+ *
+ * @retval  0 Success.
+ * @retval -1 Error.
+ */
+int
+vy_upsert(struct vy_tx *tx, struct vy_space *space,
 	  const char *tuple, const char *tuple_end,
-	  const char *ops, const char *ops_end, int index_base);
+	  const char *ops, const char *ops_end,
+	  struct tuple **old_tuple, struct tuple **new_tuple);
 
+/**
+ * Execute DELETE in the space by the specified index.
+ * @param tx             Current transaction.
+ * @param index          Vinyl index.
+ * @param key            MessagePack'ed data, the array without a
+ *                       header.
+ * @param part_count     Part count of the key.
+ * @param[out] old_tuple If not NULL then is set to the deleted
+ *                       statement.
+ *
+ * @retval  0 Success.
+ * @retval -1 Memory error.
+ */
 int
 vy_delete(struct vy_tx *tx, struct vy_index *index,
-	  const char *key, uint32_t part_count);
+	  const char *key, uint32_t part_count, struct tuple **old_tuple);
 
 int
 vy_prepare(struct vy_env *e, struct vy_tx *tx);
@@ -161,8 +252,31 @@ vy_rollback_to_savepoint(struct vy_tx *tx, void *svp);
 struct key_def *
 vy_index_key_def(struct vy_index *index);
 
+/**
+ * Create a new vinyl space and its primary index without opening
+ * it.
+ * @param env     Vinyl environment.
+ * @param key_def Key definition of the first index of the new
+ *                space.
+ * @param[out] pk Is set to the created primary index.
+ *
+ * @retval  0 Success.
+ * @retval -1 Memory error.
+ */
+struct vy_space *
+vy_new_space(struct vy_env *env, const struct key_def *key_def,
+	     struct vy_index **pk);
+
+/**
+ * Create a new vinyl secondary index without opening it.
+ * @param key_def Key definition of the new secondary index.
+ * @param space   Space, for which the new index is created.
+ *
+ * @retval  0 Success.
+ * @retval -1 Memory error.
+ */
 struct vy_index *
-vy_index_new(struct vy_env *env, struct key_def *key_def);
+vy_index_new_secondary(const struct key_def *key_def, struct vy_space *space);
 
 int
 vy_index_open(struct vy_index *index);

@@ -207,15 +207,4 @@ index_find_system(struct space *space, uint32_t index_id)
 extern "C" void
 space_run_triggers(struct space *space, bool yesno);
 
-/**
- * Checks that primary key of a tuple did not change during update,
- * otherwise throws ClientError.
- * You should not call this method, if an engine can control it by
- * itself.
- */
-void
-space_check_update(struct space *space,
-		   struct tuple *old_tuple,
-		   struct tuple *new_tuple);
-
 #endif /* TARANTOOL_BOX_SPACE_H_INCLUDED */

@@ -1731,26 +1731,32 @@ vy_tx_begin(struct tx_manager *m, struct vy_tx *tx, enum tx_type type)
 
 /**
  * Remember the read in the conflict manager index.
+ * @param tx    Current transaction.
+ * @param index Index from which attempt to read.
+ * @param stmt  Statement that was read.
+ *
+ * @retval  0 Success.
+ * @retval -1 Memory error.
  */
 static int
 vy_tx_track(struct vy_tx *tx, struct vy_index *index,
-	    struct vy_stmt *key, bool is_gap)
+	    struct vy_stmt *stmt, bool is_gap)
 {
 	if (tx->type == VINYL_TX_RO || tx->is_aborted)
 		return 0; /* no reason to track reads */
-	uint32_t part_count = vy_stmt_part_count(key, index->key_def);
+	uint32_t part_count = vy_stmt_part_count(stmt, index->key_def);
 	if (part_count >= index->key_def->part_count) {
 		struct txv *v =
-			write_set_search_key(&tx->write_set, index, key);
+			write_set_search_key(&tx->write_set, index, stmt);
 		if (v != NULL && (v->stmt->type == IPROTO_REPLACE ||
 				  v->stmt->type == IPROTO_DELETE)) {
 			/** reading from own write set is serializable */
 			return 0;
 		}
 	}
-	struct txv *v = read_set_search_key(&index->read_set, key, tx->tsn);
+	struct txv *v = read_set_search_key(&index->read_set, stmt, tx->tsn);
 	if (v == NULL) {
-		if ((v = txv_new(index, key, tx)) == NULL)
+		if ((v = txv_new(index, stmt, tx)) == NULL)
 			return -1;
 		v->is_read = true;
 		v->is_gap = is_gap;

@@ -1287,6 +1287,156 @@ struct vy_tx {
 	struct tx_manager *manager;
 };
 
+/* vy_stmt_iterator: Common interface for iterator over run, mem, etc */
+struct vy_stmt_iterator {
+	struct vy_stmt_iterator_iface *iface;
+};
+
+/** Mem iterator. See vy_mem_iterator_open for description */
+struct vy_mem_iterator {
+	/** Parent class, must be the first member */
+	struct vy_stmt_iterator base;
+
+	/* mem */
+	struct vy_mem *mem;
+
+	/* Search options */
+	/**
+	 * Iterator type, that specifies direction, start position and stop
+	 * criteria if key == NULL: GT and EQ are changed to GE, LT to LE for
+	 * beauty.
+	 */
+	enum iterator_type iterator_type;
+	/* Search key data in terms of vinyl, vy_stmt_compare_raw argument */
+	const struct vy_stmt *key;
+	/* LSN visibility, iterator shows values with lsn <= than that */
+	const int64_t *vlsn;
+
+	/* State of iterator */
+	/* Current position in tree */
+	struct vy_mem_tree_iterator curr_pos;
+	/*
+	 * The pointer on a region allocated statement from vy_mem BPS tree.
+	 * There is no guarantee that curr_pos points on curr_stmt in the tree.
+	 * For example, cur_pos can be invalid but curr_stmt can point on a
+	 * valid statement.
+	 */
+	const struct vy_stmt *curr_stmt;
+	/*
+	 * Copy of the statement returned from one of public methods
+	 * (restore/next_lsn/next_key). Need to store the copy, because can't
+	 * return region allocated curr_stmt.
+	 */
+	struct vy_stmt *last_stmt;
+	/* data version from vy_mem */
+	uint32_t version;
+
+	/* Is false until first .._next_.. method is called */
+	bool search_started;
+};
+
+/** Position of a particular stmt in vy_run. */
+struct vy_run_iterator_pos {
+	uint32_t page_no;
+	uint32_t pos_in_page;
+};
+
+/** Run iterator. See vy_run_iterator_open for description */
+struct vy_run_iterator {
+	/** Parent class, must be the first member */
+	struct vy_stmt_iterator base;
+
+	/* Members needed for memory allocation and disk access */
+	/* index */
+	struct vy_index *index;
+	/* run */
+	struct vy_run *run;
+	/* range of the run */
+	struct vy_range *range;
+
+	/* Search options */
+	/**
+	 * Iterator type, that specifies direction, start position and stop
+	 * criteria if the key is not specified, GT and EQ are changed to
+	 * GE, LT to LE for beauty.
+	 */
+	enum iterator_type iterator_type;
+	/* Search key data in terms of vinyl, vy_stmt_compare_raw argument */
+	const struct vy_stmt *key;
+	/* LSN visibility, iterator shows values with lsn <= vlsn */
+	const int64_t *vlsn;
+
+	/* State of the iterator */
+	/** Position of the current record */
+	struct vy_run_iterator_pos curr_pos;
+	/**
+	 * Last stmt returned by vy_run_iterator_get.
+	 * The iterator holds this stmt until the next call to
+	 * vy_run_iterator_get, when it's dereferenced.
+	 */
+	struct vy_stmt *curr_stmt;
+	/** Position of record that spawned curr_stmt */
+	struct vy_run_iterator_pos curr_stmt_pos;
+	/** LRU cache of two active pages (two pages is enough). */
+	struct vy_page *curr_page;
+	struct vy_page *prev_page;
+	/** Is false until first .._get ot .._next_.. method is called */
+	bool search_started;
+	/** Search is finished, you will not get more values from iterator */
+	bool search_ended;
+};
+
+/** TX write set iterator. See vy_txw_iterator_open for description */
+struct vy_txw_iterator {
+	/** Parent class, must be the first member */
+	struct vy_stmt_iterator base;
+
+	struct vy_index *index;
+	struct vy_tx *tx;
+
+	/* Search options */
+	/**
+	 * Iterator type, that specifies direction, start position and stop
+	 * criteria if key == NULL: GT and EQ are changed to GE, LT to LE for
+	 * beauty.
+	 */
+	enum iterator_type iterator_type;
+	/* Search key data in terms of vinyl, vy_stmt_compare_raw argument */
+	const struct vy_stmt *key;
+
+	/* Last version of vy_tx */
+	uint32_t version;
+	/* Current pos in txw tree */
+	struct txv *curr_txv;
+	/* Is false until first .._get ot .._next_.. method is called */
+	bool search_started;
+};
+
+/**
+ * Merge source, support structure for vy_merge_iterator
+ * Contains source iterator, additional properties and merge state
+ */
+struct vy_merge_src {
+	/** Source iterator */
+	union {
+		struct vy_run_iterator run_iterator;
+		struct vy_mem_iterator mem_iterator;
+		struct vy_txw_iterator txw_iterator;
+		struct vy_stmt_iterator iterator;
+	};
+	/** Source can change during merge iteration */
+	bool is_mutable;
+	/** Source belongs to a range (@sa vy_merge_iterator comments). */
+	bool belong_range;
+	/**
+	 * All sources with the same front_id as in struct
+	 * vy_merge_iterator are on the same key of current output
+	 * stmt (optimization)
+	 */
+	uint32_t front_id;
+	struct vy_stmt *stmt;
+};
+
 /**
  * Merge iterator takes several iterators as sources and sorts
  * output from them by the given order and LSN DESC. It has no filter,
@@ -6767,21 +6917,10 @@ struct vy_stmt_iterator_iface {
 	vy_iterator_restore_f restore;
 	vy_iterator_next_close_f close;
 };
-
-struct vy_stmt_iterator {
-	struct vy_stmt_iterator_iface *iface;
-};
-
 /* }}} vy_stmt_iterator: Common interface for iterator over run, mem, etc */
 
 /* {{{ vy_run_itr API forward declaration */
 /* TODO: move to header (with struct vy_run_itr) and remove static keyword */
-
-/** Position of a particular stmt in vy_run. */
-struct vy_run_iterator_pos {
-	uint32_t page_no;
-	uint32_t pos_in_page;
-};
 
 /**
  * Return statements from vy_run based on initial search key,
@@ -6794,50 +6933,6 @@ struct vy_run_iterator_pos {
  * and next_lsn() switches to an older statement for the same
  * key.
  */
-struct vy_run_iterator {
-	/** Parent class, must be the first member */
-	struct vy_stmt_iterator base;
-
-	/* Members needed for memory allocation and disk access */
-	/* index */
-	struct vy_index *index;
-	/* run */
-	struct vy_run *run;
-	/* range of the run */
-	struct vy_range *range;
-
-	/* Search options */
-	/**
-	 * Iterator type, that specifies direction, start position and stop
-	 * criteria if the key is not specified, GT and EQ are changed to
-	 * GE, LT to LE for beauty.
-	 */
-	enum iterator_type iterator_type;
-	/* Search key data in terms of vinyl, vy_stmt_compare_raw argument */
-	const struct vy_stmt *key;
-	/* LSN visibility, iterator shows values with lsn <= vlsn */
-	const int64_t *vlsn;
-
-	/* State of the iterator */
-	/** Position of the current record */
-	struct vy_run_iterator_pos curr_pos;
-	/**
-	 * Last stmt returned by vy_run_iterator_get.
-	 * The iterator holds this stmt until the next call to
-	 * vy_run_iterator_get, when it's dereferenced.
-	 */
-	struct vy_stmt *curr_stmt;
-	/** Position of record that spawned curr_stmt */
-	struct vy_run_iterator_pos curr_stmt_pos;
-	/** LRU cache of two active pages (two pages is enough). */
-	struct vy_page *curr_page;
-	struct vy_page *prev_page;
-	/** Is false until first .._get ot .._next_.. method is called */
-	bool search_started;
-	/** Search is finished, you will not get more values from iterator */
-	bool search_ended;
-};
-
 static void
 vy_run_iterator_open(struct vy_run_iterator *itr, struct vy_range *range,
 		     struct vy_run *run, enum iterator_type iterator_type,
@@ -7946,48 +8041,6 @@ static struct vy_stmt_iterator_iface vy_run_iterator_iface = {
  * and next_lsn() switches to an older statement for the same
  * key.
  */
-struct vy_mem_iterator {
-	/** Parent class, must be the first member */
-	struct vy_stmt_iterator base;
-
-	/* mem */
-	struct vy_mem *mem;
-
-	/* Search options */
-	/**
-	 * Iterator type, that specifies direction, start position and stop
-	 * criteria if key == NULL: GT and EQ are changed to GE, LT to LE for
-	 * beauty.
-	 */
-	enum iterator_type iterator_type;
-	/* Search key data in terms of vinyl, vy_stmt_compare_raw argument */
-	const struct vy_stmt *key;
-	/* LSN visibility, iterator shows values with lsn <= than that */
-	const int64_t *vlsn;
-
-	/* State of iterator */
-	/* Current position in tree */
-	struct vy_mem_tree_iterator curr_pos;
-	/*
-	 * The pointer on a region allocated statement from vy_mem BPS tree.
-	 * There is no guarantee that curr_pos points on curr_stmt in the tree.
-	 * For example, cur_pos can be invalid but curr_stmt can point on a
-	 * valid statement.
-	 */
-	const struct vy_stmt *curr_stmt;
-	/*
-	 * Copy of the statement returned from one of public methods
-	 * (restore/next_lsn/next_key). Need to store the copy, because can't
-	 * return region allocated curr_stmt.
-	 */
-	struct vy_stmt *last_stmt;
-	/* data version from vy_mem */
-	uint32_t version;
-
-	/* Is false until first .._next_.. method is called */
-	bool search_started;
-};
-
 /* Vtable for vy_stmt_iterator - declared below */
 static struct vy_stmt_iterator_iface vy_mem_iterator_iface;
 
@@ -8474,30 +8527,6 @@ static struct vy_stmt_iterator_iface vy_mem_iterator_iface = {
  * @sa vy_run_iterator, vy_mem_iterator, with which
  * this iterator shares the interface.
  */
-struct vy_txw_iterator {
-	/** Parent class, must be the first member */
-	struct vy_stmt_iterator base;
-
-	struct vy_index *index;
-	struct vy_tx *tx;
-
-	/* Search options */
-	/**
-	 * Iterator type, that specifies direction, start position and stop
-	 * criteria if key == NULL: GT and EQ are changed to GE, LT to LE for
-	 * beauty.
-	 */
-	enum iterator_type iterator_type;
-	/* Search key data in terms of vinyl, vy_stmt_compare_raw argument */
-	const struct vy_stmt *key;
-
-	/* Last version of vy_tx */
-	uint32_t version;
-	/* Current pos in txw tree */
-	struct txv *curr_txv;
-	/* Is false until first .._get ot .._next_.. method is called */
-	bool search_started;
-};
 
 static void
 vy_txw_iterator_open(struct vy_txw_iterator *itr,
@@ -8734,31 +8763,6 @@ static struct vy_stmt_iterator_iface vy_txw_iterator_iface = {
 /* }}} Iterator over transaction writes : implementation */
 
 /* {{{ Merge iterator */
-
-/**
- * Merge source, support structure for vy_merge_iterator
- * Contains source iterator, additional properties and merge state
- */
-struct vy_merge_src {
-	/** Source iterator */
-	union {
-		struct vy_run_iterator run_iterator;
-		struct vy_mem_iterator mem_iterator;
-		struct vy_txw_iterator txw_iterator;
-		struct vy_stmt_iterator iterator;
-	};
-	/** Source can change during merge iteration */
-	bool is_mutable;
-	/** Source belongs to a range (@sa vy_merge_iterator comments). */
-	bool belong_range;
-	/**
-	 * All sources with the same front_id as in struct
-	 * vy_merge_iterator are on the same key of current output
-	 * stmt (optimization)
-	 */
-	uint32_t front_id;
-	struct vy_stmt *stmt;
-};
 
 /**
  * Open the iterator

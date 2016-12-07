@@ -1437,6 +1437,10 @@ struct vy_merge_src {
 	struct vy_stmt *stmt;
 };
 
+enum {
+	VY_MERGE_ITERATOR_SRC_PREALLOC = 8 /* number of preallocated sources */
+};
+
 /**
  * Merge iterator takes several iterators as sources and sorts
  * output from them by the given order and LSN DESC. It has no filter,
@@ -1523,6 +1527,8 @@ struct vy_merge_iterator {
 	 * means that it must switch to next range
 	 */
 	bool range_ended;
+	/** Preallocated array of sources */
+	struct vy_merge_src src_prealloc[VY_MERGE_ITERATOR_SRC_PREALLOC];
 };
 
 struct vy_range_iterator {
@@ -8781,8 +8787,8 @@ vy_merge_iterator_open(struct vy_merge_iterator *itr, struct vy_index *index,
 	itr->iterator_type = iterator_type;
 	itr->src = NULL;
 	itr->src_count = 0;
-	itr->src_capacity = 0;
-	itr->src = NULL;
+	itr->src_capacity = VY_MERGE_ITERATOR_SRC_PREALLOC;
+	itr->src = itr->src_prealloc;
 	itr->curr_src = UINT32_MAX;
 	itr->front_id = 1;
 	itr->mutable_start = 0;
@@ -8810,7 +8816,8 @@ vy_merge_iterator_close(struct vy_merge_iterator *itr)
 	}
 	for (size_t i = 0; i < itr->src_count; i++)
 		itr->src[i].iterator.iface->close(&itr->src[i].iterator);
-	free(itr->src);
+	if (itr->src != itr->src_prealloc)
+		free(itr->src);
 	itr->src_count = 0;
 	itr->src_capacity = 0;
 	itr->src = NULL;
@@ -8830,16 +8837,16 @@ vy_merge_iterator_reserve(struct vy_merge_iterator *itr, uint32_t capacity)
 {
 	if (itr->src_capacity >= capacity)
 		return 0;
-	struct vy_merge_src *new_src = calloc(capacity, sizeof(*new_src));
+	struct vy_merge_src *new_src = malloc(capacity * sizeof(*new_src));
 	if (new_src == NULL) {
 		diag_set(OutOfMemory, capacity * sizeof(*new_src),
 			 "calloc", "new_src");
 		return -1;
 	}
-	if (itr->src_count > 0) {
+	if (itr->src_count > 0)
 		memcpy(new_src, itr->src, itr->src_count * sizeof(*new_src));
+	if (itr->src != itr->src_prealloc)
 		free(itr->src);
-	}
 	itr->src = new_src;
 	itr->src_capacity = capacity;
 	return 0;
@@ -8869,8 +8876,9 @@ vy_merge_iterator_add(struct vy_merge_iterator *itr,
 			itr->mutable_start = itr->src_count;
 		itr->mutable_end = itr->src_count + 1;
 	}
-	itr->src[itr->src_count].front_id = 0;
 	struct vy_merge_src *src = &itr->src[itr->src_count++];
+	src->front_id = 0;
+	src->stmt = NULL;
 	src->is_mutable = is_mutable;
 	src->belong_range = belong_range;
 	return src;

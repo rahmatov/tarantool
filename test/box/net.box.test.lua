@@ -386,7 +386,7 @@ box.space.test:drop()
 -- gh-970 gh-971 UPSERT over network
 _ = box.schema.space.create('test')
 _ = box.space.test:create_index('primary', {type = 'TREE', parts = {1,'unsigned'}})
-_ = box.space.test:create_index('covering', {type = 'TREE', parts = {1,'unsigned',3,'string',2,'unsigned'}})
+_ = box.space.test:create_index('covering', {type = 'TREE', unique=false, parts = {1,'unsigned',3,'string',2,'unsigned'}})
 _ = box.space.test:insert{1, 2, "string"}
 c = net:connect(box.cfg.listen)
 c.space.test:select{}

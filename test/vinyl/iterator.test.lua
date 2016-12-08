@@ -538,7 +538,7 @@ space4:drop()
 
 space = box.schema.space.create('test', { engine = 'vinyl' })
 pk = space:create_index('primary')
-idx2 = space:create_index('idx2', { parts = {2, 'unsigned'} })
+idx2 = space:create_index('idx2', { parts = {2, 'unsigned'}, unique = false })
 idx3 = space:create_index('idx3', { parts = {3, 'integer'}, unique = false })
 
 -- Test iterator type EQ

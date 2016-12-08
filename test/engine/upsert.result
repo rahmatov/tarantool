@@ -1837,7 +1837,7 @@ space = box.schema.space.create('test', { engine = engine })
 index1 = space:create_index('primary', { parts = {1, 'string'} })
 ---
 ...
-index2 = space:create_index('secondary', { parts = {2, 'scalar', 3, 'unsigned'} })
+index2 = space:create_index('secondary', { unique = false, parts = {2, 'scalar', 3, 'unsigned'} })
 ---
 ...
 -- test upsert that executes as insert in all indexes
@@ -1881,6 +1881,42 @@ index2:select{}
 - - ['a', 100, 100]
   - ['b', 100, 200]
   - ['c', 100, 300]
+...
+space:drop()
+---
+...
+--
+-- https://github.com/tarantool/tarantool/issues/1867
+-- Upsert is working on spaces with unique secondary indexes, but should not
+--
+space = box.schema.space.create('test', { engine=engine })
+---
+...
+pk = space:create_index('pk', { parts = {1, 'unsigned'} })
+---
+...
+sc = space:create_index('secondary', { parts = {2, 'unsigned'} })
+---
+...
+space:insert{1, 1}
+---
+- [1, 1]
+...
+space:insert{2, 2}
+---
+- [2, 2]
+...
+space:insert{3, 3}
+---
+- [3, 3]
+...
+space:insert{4, 4}
+---
+- [4, 4]
+...
+space:upsert({5, 5}, {{'!', 3, 5}})
+---
+- error: Space test has a unique secondary index and does not support UPSERT
 ...
 space:drop()
 ---

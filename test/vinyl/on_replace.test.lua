@@ -212,7 +212,7 @@ index:select{}
 fail = false
 space:drop()
 
--- on upsert multiple indexes
+-- on update multiple indexes
 space = box.schema.space.create('test_space', { engine = 'vinyl' })
 index = space:create_index('primary', { parts = {1, 'unsigned', 2, 'unsigned'} })
 index2 = space:create_index('secondary', { parts = {2, 'unsigned', 3, 'unsigned'} })
@@ -221,19 +221,19 @@ space:insert({1, 1, 1})
 space:insert({2, 2, 2})
 space:insert({3, 3, 3})
 tmp = space:on_replace(on_replace)
-space:upsert({1, 1, 1}, {{'+', 3, 1}})
+index:update({1, 1}, {{'+', 3, 1}})
 old_tuple, new_tuple
-space:upsert({1, 1, 1}, {{'+', 2, 1}}) -- must fail
+index:update({1, 1}, {{'+', 2, 1}}) -- must fail
 old_tuple, new_tuple
-space:upsert({4, 4, 4}, {{'!', 4, 400}})
+space:insert({4, 4, 4})
 old_tuple, new_tuple
 index:select{}
 index2:select{}
 index3:select{}
 fail = true
-space:upsert({2, 2, 2}, {{'!', 4, 200}})
+index:update({2, 2}, {{'!', 4, 200}})
 old_tuple, new_tuple
-space:upsert({5, 5, 5}, {{'!', 4, 500}})
+index:insert({5, 5}, {{'!', 4, 500}})
 old_tuple, new_tuple
 fail = false
 space:drop()

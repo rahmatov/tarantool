@@ -98,15 +98,11 @@ space:drop()
 
 space = box.schema.space.create('test', { engine = 'vinyl' })
 pk = space:create_index('primary', { page_size = 512, range_size = 1024 * 12 })
-index2 = space:create_index('secondary', { parts = {2, 'string'}, page_size = 512, range_size = 1024 * 12 })
+index2 = space:create_index('secondary', { unique = false, parts = {2, 'string'}, page_size = 512, range_size = 1024 * 12 })
 for i = 1, 100 do space:insert{i, ''..i} if i % 2 == 0 then box.snapshot() end end
 space:delete{1}
 space:delete{10}
 space:delete{100}
-box.snapshot()
-
-index2:delete{'9'}
-index2:delete{'99'}
 box.snapshot()
 
 space:select{2}

@@ -284,7 +284,7 @@ space:drop()
 
 space = box.schema.space.create('test', { engine = engine })
 index1 = space:create_index('primary', { parts = {1, 'string'} })
-index2 = space:create_index('secondary', { parts = {2, 'scalar', 3, 'unsigned'} })
+index2 = space:create_index('secondary', { unique = false, parts = {2, 'scalar', 3, 'unsigned'} })
 -- test upsert that executes as insert in all indexes
 space:upsert({'a', 100, 100}, {{'!', 4, 200}})
 space:upsert({'b', 100, 200}, {{'!', 4, 300}})
@@ -297,6 +297,23 @@ space:upsert({'a', 100, 100}, {{'=', 3, -200}}) -- must fail on cheking new tupl
 space:upsert({'b', 100, 200}, {{'=', 1, 'd'}}) -- must fail with attempt to modify primary index
 index1:select{}
 index2:select{}
+
+space:drop()
+
+--
+-- https://github.com/tarantool/tarantool/issues/1867
+-- Upsert is working on spaces with unique secondary indexes, but should not
+--
+
+space = box.schema.space.create('test', { engine=engine })
+pk = space:create_index('pk', { parts = {1, 'unsigned'} })
+sc = space:create_index('secondary', { parts = {2, 'unsigned'} })
+space:insert{1, 1}
+space:insert{2, 2}
+space:insert{3, 3}
+space:insert{4, 4}
+
+space:upsert({5, 5}, {{'!', 3, 5}})
 
 space:drop()
 

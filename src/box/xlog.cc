@@ -853,8 +853,11 @@ xlog_tx_write_zstd(struct xlog *log)
 		size_t zsize = fcompress(log->zctx, zdst, zmax_size,
 					 (char *)iov->iov_base + offset,
 					 iov->iov_len - offset);
-		if (ZSTD_isError(zsize))
+		if (ZSTD_isError(zsize)) {
+			diag_set(SystemError, "failed to compress tx to '%s' file",
+				 log->filename);
 			goto error;
+		}
 		/* Advance output buffer to the end of compressed data. */
 		obuf_alloc(&log->zbuf, zsize);
 		/* Update crc32c */
@@ -884,8 +887,11 @@ xlog_tx_write_zstd(struct xlog *log)
 
 	written = fio_writev(log->fd, log->zbuf.iov,
 			     log->zbuf.pos + 1);
-	if (written < (ssize_t)obuf_size(&log->zbuf))
+	if (written < (ssize_t)obuf_size(&log->zbuf)) {
+		diag_set(SystemError, "failed to write to '%s' file",
+			 log->filename);
 		goto error;
+	}
 	obuf_reset(&log->zbuf);
 	return written;
 error:
@@ -983,6 +989,7 @@ xlog_write_row(struct xlog *log, const struct xrow_header *packet)
 	for (int i = 0; i < iovcnt; ++i) {
 		ERROR_INJECT(ERRINJ_WAL_WRITE_PARTIAL,
 			{if (obuf_size(&log->obuf) > (1 << 14)) {
+				tnt_error(SystemError, "xlog write injection");
 				obuf_rollback_to_svp(&log->obuf, &svp);
 				return -1;}});
 		if (obuf_dup(&log->obuf, iov[i].iov_base, iov[i].iov_len) <

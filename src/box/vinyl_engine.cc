@@ -46,8 +46,146 @@
 #include "relay.h"
 #include "space.h"
 #include "schema.h"
+#include "recovery.h" /* recovery->server_id */
 #include "iproto_constants.h"
 #include "vinyl.h"
+
+/*
+ * Try to decode u64 from MsgPack data.
+ * Return true on success.
+ */
+static inline bool
+mp_decode_uint_check(const char **data, uint64_t *pval)
+{
+	if (mp_typeof(**data) != MP_UINT)
+		return false;
+	*pval = mp_decode_uint(data);
+	return true;
+}
+
+/*
+ * Try to decode u32 from MsgPack data.
+ * Return true on success.
+ */
+static inline bool
+mp_decode_u32_check(const char **data, uint32_t *pval)
+{
+	uint64_t val;
+	if (!mp_decode_uint_check(data, &val))
+		return false;
+	if (val > UINT32_MAX)
+		return false;
+	*pval = val;
+	return true;
+}
+
+/*
+ * Delete a stale run record from the vinyl metadata table
+ * along with the file it references.
+ */
+static void
+vinyl_purge_meta(struct tuple *tuple)
+{
+	uint32_t size;
+	const char *data = tuple_data_range(tuple, &size);
+	/*
+	 * Extract vinyl metadata from the tuple.
+	 * Silently ignore alien records.
+	 */
+	uint32_t server_id;
+	uint64_t run_id;
+	uint32_t space_id;
+	uint32_t index_id;
+	uint64_t index_lsn;
+	uint32_t state;
+	if (mp_decode_array(&data) < 6 ||
+	    !mp_decode_u32_check(&data, &server_id) ||
+	    !mp_decode_uint_check(&data, &run_id) ||
+	    !mp_decode_u32_check(&data, &space_id) ||
+	    !mp_decode_u32_check(&data, &index_id) ||
+	    !mp_decode_uint_check(&data, &index_lsn) ||
+	    !mp_decode_u32_check(&data, &state))
+		return;
+	/* Filter records that belong to other servers. */
+	if (server_id != recovery->server_id)
+		return;
+	/*
+	 * Lookup the index this record belongs to.
+	 *
+	 * TODO: Delete records left from dropped indexes.
+	 */
+	struct space *space = space_by_id(space_id);
+	if (space == NULL)
+		return;
+	VinylIndex *index = (VinylIndex *)space_index(space, index_id);
+	if (index == NULL ||
+	    index->key_def->opts.lsn != (int64_t)index_lsn)
+		return;
+
+	/*
+	 * Delete the record if it is stale, i.e. left from
+	 * a deleted or failed run.
+	 *
+	 * TODO: Delete reserved records.
+	 */
+	if (state == VY_RUN_DELETED ||
+	    state == VY_RUN_FAILED)
+		vy_index_purge_run(index->db, run_id);
+}
+
+/*
+ * Replay a record from the vinyl metadata table.
+ * Called on recovery.
+ */
+static void
+vinyl_recovery_trigger_f(struct trigger *trigger, void *event)
+{
+	(void)trigger;
+	struct txn *txn = (struct txn *)event;
+	struct txn_stmt *stmt = txn_current_stmt(txn);
+	struct tuple *tuple = stmt->new_tuple;
+	if (tuple == NULL)
+		return;
+
+	uint32_t server_id = tuple_field_u32(tuple, 0);
+	if (server_id != recovery->server_id)
+		return;
+
+	uint64_t run_id = tuple_field_uint(tuple, 1);
+	uint32_t space_id = tuple_field_u32(tuple, 2);
+	uint32_t index_id = tuple_field_u32(tuple, 3);
+	uint64_t index_lsn = tuple_field_uint(tuple, 4);
+	enum vy_run_state state = (enum vy_run_state)tuple_field_u32(tuple, 5);
+	const char *begin = tuple_field_check(tuple, 6, MP_ARRAY);
+	const char *end = tuple_field_check(tuple, 7, MP_ARRAY);
+
+	struct space *space = space_by_id(space_id);
+	if (space == NULL)
+		return;
+	VinylIndex *index = (VinylIndex *)space_index(space, index_id);
+	if (index == NULL || index->key_def->opts.lsn != (int64_t)index_lsn)
+		return;
+
+	switch (state) {
+	case VY_RUN_COMMITTED:
+		if (vy_recovery_insert_run(index->db, run_id, begin, end) != 0)
+			diag_raise();
+		break;
+	case VY_RUN_DELETED:
+		if (vy_recovery_delete_run(index->db, run_id, begin, end) != 0)
+			diag_raise();
+		break;
+	case VY_RUN_RESERVED:
+	case VY_RUN_FAILED:
+		break;
+	default:
+		tnt_raise(ClientError, ER_VINYL, "invalid metadata");
+	}
+}
+
+static struct trigger vinyl_recovery_trigger = {
+	RLIST_LINK_INITIALIZER, vinyl_recovery_trigger_f, NULL, NULL
+};
 
 /* Used by lua/info.c */
 extern "C" struct vy_env *
@@ -60,6 +198,7 @@ vinyl_engine_get_env()
 VinylEngine::VinylEngine()
 	:Engine("vinyl")
 	,recovery_complete(false)
+	,gc_iter(NULL)
 {
 	flags = 0;
 	env = NULL;
@@ -89,6 +228,8 @@ VinylEngine::bootstrap()
 void
 VinylEngine::beginInitialRecovery(struct vclock *vclock)
 {
+	struct space *space = space_cache_find(BOX_VINYL_ID);
+	trigger_add(&space->on_replace, &vinyl_recovery_trigger);
 	vy_begin_initial_recovery(env, vclock);
 }
 
@@ -103,7 +244,9 @@ VinylEngine::endRecovery()
 {
 	assert(!recovery_complete);
 	/* complete two-phase recovery */
-	vy_end_recovery(env);
+	if (vy_end_recovery(env) != 0)
+		diag_raise();
+	trigger_clear(&vinyl_recovery_trigger);
 	recovery_complete = true;
 }
 
@@ -311,15 +454,70 @@ VinylEngine::rollbackStatement(struct txn *txn, struct txn_stmt *stmt)
 				 stmt->engine_savepoint);
 }
 
+void
+VinylEngine::gc_iter_init()
+{
+	assert(gc_iter == NULL);
+	struct space *space = space_cache_find(BOX_VINYL_ID);
+	Index *pk = index_find(space, 0);
+	gc_iter = pk->allocIterator();
+	pk->initIterator(gc_iter, ITER_ALL, NULL, 0);
+	pk->createReadViewForIterator(gc_iter);
+}
+
+void
+VinylEngine::gc_iter_destroy()
+{
+	assert(gc_iter != NULL);
+	struct space *space = space_cache_find(BOX_VINYL_ID);
+	Index *pk = space_index(space, 0);
+	pk->destroyReadViewForIterator(gc_iter);
+	gc_iter->free(gc_iter);
+	gc_iter = NULL;
+}
+
+void
+VinylEngine::gc()
+{
+	assert(gc_iter != NULL);
+
+	struct tuple *tuple;
+	while ((tuple = gc_iter->next(gc_iter)) != NULL)
+		vinyl_purge_meta(tuple);
+
+	gc_iter_destroy();
+}
 
 int
 VinylEngine::beginCheckpoint()
 {
-	return vy_checkpoint(env);
+	if (vy_checkpoint(env) != 0)
+		return -1;
+	/*
+	 * Open the read iterator used for garbage collection when
+	 * checkpoint begins, so that runs deleted during checkpoint
+	 * and therefore excluded from the snapshot are not removed.
+	 */
+	gc_iter_init();
+	return 0;
 }
 
 int
 VinylEngine::waitCheckpoint(struct vclock* vclock)
 {
 	return vy_wait_checkpoint(env, vclock);
+}
+
+void
+VinylEngine::commitCheckpoint(struct vclock *vclock)
+{
+	(void)vclock;
+	gc();
+}
+
+void
+VinylEngine::abortCheckpoint()
+{
+	if (gc_iter != NULL)
+		gc_iter_destroy();
 }

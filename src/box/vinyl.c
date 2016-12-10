@@ -63,6 +63,8 @@
 #include "tuple.h"
 #include "tuple_update.h"
 #include "txn.h" /* box_txn_alloc() */
+#include "box.h"
+#include "recovery.h" /* recovery->server_id */
 #include "iproto_constants.h"
 #include "cluster.h" /* SERVER_UUID */
 #include "vclock.h"
@@ -125,6 +127,10 @@ struct vy_env {
 	pthread_key_t       zdctx_key;
 	/** Timer for updating quota watermark. */
 	ev_timer            quota_timer;
+	/** Set in case of recovery from a remote master. */
+	bool                is_remote_recovery;
+	/** Set if this env is under destruction. */
+	bool                is_destroying;
 };
 
 struct vy_buf {
@@ -928,6 +934,11 @@ struct vy_mem {
 	struct tuple_format *format;
 	/** version is initially 0 and is incremented on every write */
 	uint32_t version;
+	/**
+	 * Unique ID of this in-memory index. When the index gets
+	 * dumped, its ID is inherited by the underlying run.
+	 */
+	int64_t id;
 	/* Memory allocator for statements and BPS tree nodes. */
 	struct region region;
 };
@@ -982,6 +993,7 @@ vy_mem_new(struct key_def *key_def, struct tuple_format *format)
 			 "malloc", "struct vy_mem");
 		return NULL;
 	}
+	index->id = -1;
 	index->min_lsn = INT64_MAX;
 	index->used = 0;
 	index->key_def = key_def;
@@ -1123,10 +1135,11 @@ struct vy_run {
 	int refs;
 	/** Link in range->runs list. */
 	struct rlist link;
+	/** Unique ID of this run. */
+	int64_t id;
 };
 
 struct vy_range {
-	int64_t   id;
 	/**
 	 * Range lower bound. NULL if range is leftmost.
 	 * Both 'begin' and 'end' statements have SELECT type with the full
@@ -1244,12 +1257,6 @@ struct vy_index {
 
 	/** Member of env->indexes. */
 	struct rlist link;
-	/**
-	 * For each index range list modification,
-	 * get a new range id and increment this variable.
-	 * For new ranges, use this id as a sequence.
-	 */
-	int64_t range_id_max;
 	/**
 	 * Incremented for each change of the range list,
 	 * to invalidate iterators.
@@ -1895,6 +1902,7 @@ vy_run_new()
 	}
 	memset(&run->info, 0, sizeof(run->info));
 	vy_buf_create(&run->info.pages_min);
+	run->id = -1;
 	run->fd = -1;
 	run->refs = 1;
 	rlist_create(&run->link);
@@ -1927,6 +1935,36 @@ vy_run_unref(struct vy_run *run)
 		vy_run_delete(run);
 }
 
+/**
+ * A quick intro into Vinyl cosmology and file format
+ * --------------------------------------------------
+ * A single vinyl index on disk consists of a set of "range"
+ * objects. A range contains a sorted set of index keys;
+ * keys in different ranges do not overlap, for example:
+ * [0..100],[103..252],[304..360]
+ *
+ * The sorted set of keys in a range is called a run. A single
+ * range may contain multiple runs, each run contains changes of
+ * keys in the range over a certain period of time. The periods do
+ * not overlap, while, of course, two runs of the same range may
+ * contain changes of the same key.
+ * All keys in a run are sorted and split between pages of
+ * approximately equal size. The purpose of putting keys into
+ * pages is a quicker key lookup, since (min,max) key of every
+ * page is put into the page index, stored at the beginning of each
+ * run. The page index of an active run is fully cached in RAM.
+ *
+ * All files of an index have the following name pattern:
+ * <run_id>.{index,run}
+ * and are stored together in the index directory.
+ *
+ * Files that end with '.index' store metadata (see vy_run_info)
+ * while '.run' files store vinyl statements.
+ *
+ * <run_id> component represents the id of the run. The id is a
+ * monotonically growing integer, unique system-wide, assigned
+ * to a run when it's created.
+ */
 enum vy_file_type {
 	VY_FILE_INDEX,
 	VY_FILE_RUN,
@@ -1939,37 +1977,12 @@ static const char *vy_file_suffix[] = {
 };
 
 static int
-vy_run_parse_name(const char *name, int64_t *index_lsn, int64_t *range_id,
-		  int *run_id, enum vy_file_type *type)
-{
-	int n = 0;
-
-	sscanf(name, "%"SCNx64".%"SCNx64".%d.%n",
-	       index_lsn, range_id, run_id, &n);
-	if (*run_id < 0)
-		return -1;
-
-	int i;
-	const char *suffix = name + n;
-	for (i = 0; i < vy_file_MAX; i++) {
-		if (strcmp(suffix, vy_file_suffix[i]) == 0)
-			break;
-	}
-	if (i >= vy_file_MAX)
-		return -1;
-
-	*type = i;
-	return 0;
-}
-
-static int
 vy_run_snprint_path(char *buf, size_t size, const char *dir,
-		    int64_t index_lsn, int64_t range_id, int run_id,
-		    enum vy_file_type type)
+		    int64_t id, enum vy_file_type type)
 {
-	return snprintf(buf, size, "%s/%016"PRIx64".%016"PRIx64".%d.%s",
-			dir, index_lsn, range_id, run_id,
-			vy_file_suffix[type]);
+	assert(id >= 0);
+	return snprintf(buf, size, "%s/%"PRIi64".%s",
+			dir, id, vy_file_suffix[type]);
 }
 
 static void
@@ -2024,8 +2037,8 @@ vy_range_snprint(char *buf, int size, const struct vy_range *range)
 	struct key_def *key_def = range->index->key_def;
 
 	SNPRINT(total, snprintf, buf, size,
-		"%"PRIu32"/%"PRIu32"/%016"PRIx64".%016"PRIx64"(",
-		 key_def->space_id, key_def->iid, key_def->opts.lsn, range->id);
+		"%"PRIu32"/%"PRIu32"/%"PRIi64" ",
+		 key_def->space_id, key_def->iid, key_def->opts.lsn);
 	SNPRINT(total, vy_key_snprint, buf, size,
 		range->begin != NULL ? vy_key_data(range->begin) : NULL);
 	SNPRINT(total, snprintf, buf, size, "..");
@@ -2053,6 +2066,17 @@ static void
 vy_scheduler_mem_dirtied(struct vy_scheduler *scheduler, struct vy_mem *mem);
 static void
 vy_scheduler_mem_dumped(struct vy_scheduler *scheduler, struct vy_mem *mem);
+
+static int
+vy_meta_insert_run(struct vy_stmt *begin, struct vy_stmt *end,
+		   struct key_def *key_def, enum vy_run_state state,
+		   int64_t *p_run_id);
+static int
+vy_meta_prepare_compact(int n_parts, struct vy_range **parts);
+static int
+vy_meta_commit_compact(struct vy_range *range);
+static void
+vy_meta_abort_compact(struct vy_range *range);
 
 static int
 vy_range_tree_cmp(struct vy_range *a, struct vy_range *b);
@@ -2116,6 +2140,54 @@ vy_range_tree_key_cmp(const struct vy_stmt *stmt, struct vy_range *range)
 	struct key_def *key_def = range->index->key_def;
 	struct tuple_format *format = range->index->format;
 	return vy_stmt_compare_with_key(stmt, range->begin, format, key_def);
+}
+
+/*
+ * Compare range->begin with another range's begin.
+ */
+static int
+vy_range_compare_begin(struct vy_range *range, struct vy_stmt *begin)
+{
+	if (range->begin == NULL)
+		return begin == NULL ? 0 : -1;
+	if (begin == NULL)
+		return 1;
+	return vy_key_compare(range->begin, begin, range->index->key_def);
+}
+
+/*
+ * Compare range->end with another range's end.
+ */
+static int
+vy_range_compare_end(struct vy_range *range, struct vy_stmt *end)
+{
+	if (range->end == NULL)
+		return end == NULL ? 0 : 1;
+	if (end == NULL)
+		return -1;
+	return vy_key_compare(range->end, end, range->index->key_def);
+}
+
+/*
+ * Compare range->begin with another range's end.
+ */
+static int
+vy_range_compare_begin_with_end(struct vy_range *range, struct vy_stmt *end)
+{
+	if (range->begin == NULL || end == NULL)
+		return -1;
+	return vy_key_compare(range->begin, end, range->index->key_def);
+}
+
+/*
+ * Compare range->end with another range's begin.
+ */
+static int
+vy_range_compare_end_with_begin(struct vy_range *range, struct vy_stmt *begin)
+{
+	if (range->end == NULL || begin == NULL)
+		return 1;
+	return vy_key_compare(range->end, begin, range->index->key_def);
 }
 
 static void
@@ -2240,8 +2312,6 @@ vy_range_tree_find_by_key(vy_range_tree_t *tree,
 			range = vy_range_tree_last(tree);
 		}
 	}
-	/* Range tree must span all possible keys. */
-	assert(range != NULL);
 	return range;
 }
 
@@ -2350,242 +2420,6 @@ vy_index_remove_range(struct vy_index *index, struct vy_range *range)
 {
 	vy_range_tree_remove(&index->tree, range);
 	index->range_count--;
-}
-
-/*
- * Check if a is left-adjacent to b, i.e. a->end == b->begin.
- */
-static bool
-vy_range_is_adjacent(struct vy_range *a, struct vy_range *b,
-		     struct key_def *key_def)
-{
-	if (a->end == NULL || b->begin == NULL)
-		return false;
-	assert(a->index == b->index);
-	return vy_key_compare(a->end, b->begin, key_def) == 0;
-}
-
-/*
- * Check if a precedes b, i.e. a->end <= b->begin.
- */
-static bool
-vy_range_precedes(struct vy_range *a, struct vy_range *b,
-		  struct key_def *key_def)
-{
-	if (a->end == NULL || b->begin == NULL)
-		return false;
-	assert(a->index == b->index);
-	return vy_key_compare(a->end, b->begin, key_def) <= 0;
-}
-
-/*
- * Check if a ends before b, i.e. a->end < b->end.
- */
-static bool
-vy_range_ends_before(struct vy_range *a, struct vy_range *b,
-		     struct key_def *key_def)
-{
-	if (b->end == NULL)
-		return a->end != NULL;
-	if (a->end == NULL)
-		return false;
-	assert(a->index == b->index);
-	return vy_key_compare(a->end, b->end, key_def) < 0;
-}
-
-/*
- * Check if ranges present in an index span a range w/o holes. If they
- * do, delete the range, otherwise remove all ranges of the index
- * intersecting the range (if any) and insert the range instead.
- */
-static void
-vy_index_recover_range(struct vy_index *index, struct vy_range *range)
-{
-	/*
-	 * The algorithm can be briefly outlined by the following steps:
-	 *
-	 * 1. Find the first range in the index having an intersection
-	 *    with the given one. If there is no such range, go to step
-	 *    4, otherwise check if the found range can be the first
-	 *    spanning range, i.e. if it starts before or at the same
-	 *    point as the given range. If it does, proceed to step 2,
-	 *    otherwise go to step 3.
-	 *
-	 * 2. Check if there are holes in the span. To do it, iterate
-	 *    over all intersecting ranges and check that for each two
-	 *    neighbouring ranges the end of the first one equals the
-	 *    beginning of the second one. If there is a hole, proceed
-	 *    to step 3, otherwise delete the given range and return.
-	 *
-	 * 3. Remove all ranges intersecting the given range from the
-	 *    index.
-	 *
-	 * 4. Insert the given range to the index.
-	 */
-	struct vy_range *first, *prev, *n;
-
-	first = vy_range_tree_first(&index->tree);
-	if (first == NULL) {
-		/* Trivial case - the index tree is empty. */
-		goto insert;
-	}
-
-	/*
-	 * 1. Find the first intersecting range.
-	 */
-	if (range->begin == NULL) {
-		/*
-		 * The given range starts with -inf.
-		 * Check the leftmost.
-		 */
-		if (vy_range_precedes(range, first, index->key_def)) {
-			/*
-			 * The given range precedes the leftmost,
-			 * hence no intersection is possible.
-			 *
-			 *   ----range----|   |----first----|
-			 */
-			goto insert;
-		}
-		if (first->begin != NULL) {
-			/*
-			 * The leftmost range does not span -inf,
-			 * so there cannot be a span, but there is
-			 * an intersection.
-			 *
-			 *   -----range-----|
-			 *              |------first------|
-			 */
-			goto replace;
-		}
-		/*
-		 * Possible span. Check for holes.
-		 *
-		 *   --------range--------|
-		 *   ----first----|
-		 */
-		goto check;
-	}
-	/*
-	 * The given range starts with a finite key (> -inf).
-	 * Check the predecessor.
-	 */
-	prev = vy_range_tree_psearch(&index->tree, range->begin);
-	if (prev == NULL) {
-		/*
-		 * There is no predecessor, i.e. no range with
-		 * begin <= range->begin. Check if the first range
-		 * in the index intersects the given range.
-		 */
-		if (vy_range_precedes(range, first, index->key_def)) {
-			/*
-			 * No intersections. The given range is
-			 * going to be leftmost in the index.
-			 *
-			 *   |----range----|   |---first---|
-			 */
-			goto insert;
-		}
-		/*
-		 * Neither strict succession nor strict precedence:
-		 * the first range intersects the given one.
-		 *
-		 *   |------range------|
-		 *                |------first------|
-		 */
-		goto replace;
-	}
-	/*
-	 * There is a predecessor. Check whether it intersects
-	 * the given range.
-	 */
-	if (vy_range_precedes(prev, range, index->key_def)) {
-		/*
-		 * The predecessor does not intersect the given
-		 * range, hence there is no span. Check if there
-		 * is an intersection with the successor (if any).
-		 */
-		n = vy_range_tree_next(&index->tree, prev);
-		if (n == NULL || vy_range_precedes(range, n, index->key_def)) {
-			/*
-			 * No successor or the given range
-			 * precedes it, hence no intersections.
-			 *
-			 *   |--prev--| |--range--| |--next--|
-			 */
-			goto insert;
-		} else {
-			/*
-			 * There is an overlap with the successor.
-			 *
-			 *   |--prev--| |--range--|
-			 *                    |-----next-----|
-			 */
-			first = n;
-			goto replace;
-		}
-	} else {
-		/*
-		 * There is an intersection between the given range
-		 * and the predecessor, so there might be a span.
-		 * Check for holes.
-		 *
-		 *   |-------prev-------|
-		 *                |-------range-------|
-		 */
-		first = prev;
-	}
-check:
-	/*
-	 * 2. Check for holes in the spanning range.
-	 */
-	n = first;
-	prev = NULL;
-	do {
-		if (prev != NULL &&
-		    !vy_range_is_adjacent(prev, n, index->key_def)) {
-			/*
-			 * There is a hole in the spanning range.
-			 *
-			 *   |---prev---|   |---next---|
-			 *        |----------range----------|
-			 */
-			break;
-		}
-		if (!vy_range_ends_before(n, range, index->key_def)) {
-			/*
-			 * Spanned the whole range w/o holes.
-			 *
-			 *                       |---next---|
-			 *   |----------range----------|
-			 */
-			say_warn("found stale range %s", vy_range_str(range));
-			vy_range_delete(range);
-			return;
-		}
-		prev = n;
-		n = vy_range_tree_next(&index->tree, n);
-	} while (n != NULL);
-	/* Fall through. */
-replace:
-	/*
-	 * 3. Remove intersecting ranges.
-	 */
-	n = first;
-	do {
-		struct vy_range *next = vy_range_tree_next(&index->tree, n);
-		say_warn("found partial range %s", vy_range_str(n));
-		vy_index_remove_range(index, n);
-		vy_range_delete(n);
-		n = next;
-	} while (n != NULL && !vy_range_precedes(range, n, index->key_def));
-	/* Fall through. */
-insert:
-	/*
-	 * 4. Insert the given range to the index.
-	 */
-	vy_index_add_range(index, range);
-	say_debug("range recover insert: %s", vy_range_str(range));
 }
 
 /* dump statement to the run page buffers (stmt header and data) */
@@ -2757,7 +2591,6 @@ out:
  */
 static int
 vy_run_write_data(struct vy_run *run, const char *dirpath,
-		  int64_t range_id, int run_id,
 		  struct vy_write_iterator *wi, struct vy_stmt **curr_stmt,
 		  const struct vy_stmt *end_key,
 		  const struct key_def *key_def,
@@ -2768,8 +2601,7 @@ vy_run_write_data(struct vy_run *run, const char *dirpath,
 
 	char path[PATH_MAX];
 	vy_run_snprint_path(path, sizeof(path), dirpath,
-			    key_def->opts.lsn, range_id, run_id,
-			    VY_FILE_RUN);
+			    run->id, VY_FILE_RUN);
 	struct xlog data_xlog;
 	struct xlog_meta meta = {
 		.filetype = "RUN",
@@ -2838,7 +2670,7 @@ const uint64_t vy_page_info_key_map = (1 << VY_PAGE_REQUEST_COUNT) |
  */
 static int
 vy_page_info_encode(const struct vy_page_info *page_info, const char *min_key,
-		    int run_id, struct xrow_header *xrow)
+		    int64_t run_id, struct xrow_header *xrow)
 {
 	struct region *region = &fiber()->gc;
 
@@ -2902,7 +2734,7 @@ vy_page_info_encode(const struct vy_page_info *page_info, const char *min_key,
  * @retval -1 error, check diag
  */
 static int
-vy_page_info_decode(const struct xrow_header *xrow, int run_id,
+vy_page_info_decode(const struct xrow_header *xrow, int64_t run_id,
 		    struct vy_page_info *page, struct vy_run_info *run_info)
 {
 	struct request request;
@@ -2920,7 +2752,7 @@ vy_page_info_decode(const struct xrow_header *xrow, int run_id,
 			 "tuple is too small");
 		return -1;
 	}
-	if (run_id != (int) mp_decode_uint(&pos)) {
+	if (run_id != (int64_t)mp_decode_uint(&pos)) {
 		diag_set(ClientError, ER_VINYL, "Can't decode page meta "
 			 "incorrect run id");
 		return -1;
@@ -3005,7 +2837,7 @@ const uint64_t vy_run_info_key_map = (1 << VY_RUN_MIN_LSN) |
  * @retval -1 on error, check diag
  */
 static int
-vy_run_info_encode(const struct vy_run_info *run_info, int run_id,
+vy_run_info_encode(const struct vy_run_info *run_info, int64_t run_id,
 		   const struct vy_stmt *begin,
 		   const struct vy_stmt *end,
 		   struct xrow_header *xrow)
@@ -3072,7 +2904,7 @@ vy_run_info_encode(const struct vy_run_info *run_info, int run_id,
 	/* put tuple in a replace request to run's space */
 	struct request request;
 	request_create(&request, IPROTO_REPLACE);
-	request.space_id = BOX_VINYL_RUN_ID;;
+	request.space_id = BOX_VINYL_ID;
 	request.index_id = 0;
 	request.tuple = tuple;
 	request.tuple_end = pos;
@@ -3101,7 +2933,7 @@ vy_run_info_encode(const struct vy_run_info *run_info, int run_id,
 static int
 vy_run_info_decode(const struct xrow_header *xrow,
 		   const struct key_def *key_def,
-		   struct vy_run_info *run_info, int *p_run_id,
+		   struct vy_run_info *run_info, int64_t *p_run_id,
 		   struct vy_stmt **p_begin, struct vy_stmt **p_end)
 {
 	struct vy_stmt *begin = NULL;
@@ -3115,7 +2947,7 @@ vy_run_info_decode(const struct xrow_header *xrow,
 	}
 
 	/* decode run */
-	if (request.space_id != BOX_VINYL_RUN_ID) {
+	if (request.space_id != BOX_VINYL_ID) {
 		diag_set(ClientError, ER_VINYL, "Can't decode run meta: "
 			 "incorrect space id");
 		return -1;
@@ -3126,7 +2958,7 @@ vy_run_info_decode(const struct xrow_header *xrow,
 			 "not enough values");
 		return -1;
 	}
-	int run_id = mp_decode_uint(&pos);
+	int64_t run_id = mp_decode_uint(&pos);
 	memset(run_info, 0, sizeof(*run_info));
 	uint64_t key_map = vy_run_info_key_map;
 	uint32_t map_size = mp_decode_map(&pos);
@@ -3197,15 +3029,11 @@ fail:
  */
 static int
 vy_run_write_index(struct vy_run *run, const char *dirpath,
-		   int64_t range_id, int run_id,
-		   const struct vy_stmt *begin,
-		   const struct vy_stmt *end,
-		   const struct key_def *key_def)
+		   const struct vy_stmt *begin, const struct vy_stmt *end)
 {
 	char path[PATH_MAX];
 	vy_run_snprint_path(path, sizeof(path), dirpath,
-			    key_def->opts.lsn, range_id, run_id,
-			    VY_FILE_INDEX);
+			    run->id, VY_FILE_INDEX);
 
 	struct xlog index_xlog;
 	struct xlog_meta meta = {
@@ -3219,7 +3047,7 @@ vy_run_write_index(struct vy_run *run, const char *dirpath,
 	xlog_tx_begin(&index_xlog);
 
 	struct xrow_header xrow;
-	if (vy_run_info_encode(&run->info, run_id, begin, end,
+	if (vy_run_info_encode(&run->info, run->id, begin, end,
 			       &xrow) != 0 ||
 	    xlog_write_row(&index_xlog, &xrow) < 0)
 		goto fail;
@@ -3228,7 +3056,7 @@ vy_run_write_index(struct vy_run *run, const char *dirpath,
 		struct vy_page_info *page_info = vy_run_page_info(run, page_no);
 		const char *min_key = vy_run_page_min_key(run, page_info);
 		struct xrow_header xrow;
-		if (vy_page_info_encode(page_info, min_key, run_id, &xrow) < 0) {
+		if (vy_page_info_encode(page_info, min_key, run->id, &xrow) < 0) {
 			goto fail;
 		}
 		if (xlog_write_row(&index_xlog, &xrow) < 0)
@@ -3255,7 +3083,7 @@ fail:
  * restore from disk).
  */
 static struct vy_range *
-vy_range_new(struct vy_index *index, int64_t id,
+vy_range_new(struct vy_index *index,
 	     struct vy_stmt *begin, struct vy_stmt *end)
 {
 	struct vy_range *range = (struct vy_range*) calloc(1, sizeof(*range));
@@ -3263,19 +3091,6 @@ vy_range_new(struct vy_index *index, int64_t id,
 		diag_set(OutOfMemory, sizeof(struct vy_range), "malloc",
 			 "struct vy_range");
 		return NULL;
-	}
-	if (id != 0) {
-		range->id = id;
-		/** Recovering an existing range from disk. Update
-		 * range_id_max to not create a new range wit the
-		 * same id.
-		 */
-		index->range_id_max = MAX(index->range_id_max, id);
-	} else {
-		/**
-		 * Creating a new range. Assign a new id.
-	         */
-		range->id = ++index->range_id_max;
 	}
 	if (begin != NULL) {
 		vy_stmt_ref(begin);
@@ -3296,38 +3111,59 @@ vy_range_new(struct vy_index *index, int64_t id,
 }
 
 static int
-vy_range_recover_run(struct vy_range *range, int run_id)
+vy_range_recover_run(struct vy_range *range, int64_t run_id)
 {
 	const struct vy_index *index = range->index;
 	const struct key_def *key_def = index->key_def;
 
+	char path[PATH_MAX];
+	vy_run_snprint_path(path, sizeof(path), index->path,
+			    run_id, VY_FILE_INDEX);
+	if (access(path, F_OK) < 0 && errno == ENOENT) {
+		/* The run was not dumped. Create a mem instead. */
+		struct vy_mem *mem = vy_mem_new(index->key_def, index->format);
+		if (mem == NULL)
+			return -1;
+		mem->id = run_id;
+		rlist_add_entry(&range->mems, mem, link);
+		range->mem_count++;
+		return 0;
+	}
+
 	struct vy_run *run = vy_run_new();
 	if (run == NULL)
 		return -1;
+	run->id = run_id;
 
-	char path[PATH_MAX];
-	vy_run_snprint_path(path, sizeof(path), index->path,
-			    key_def->opts.lsn, range->id, run_id,
-			    VY_FILE_INDEX);
 	struct xlog_cursor cursor;
 	if (xlog_cursor_open(&cursor, path))
 		goto fail;
 
 	/* Read run header. */
 	struct xrow_header xrow;
-	int run_id_check = 0;
+	int64_t run_id_check = 0;
+	struct vy_stmt *begin_check, *end_check;
 	/* all rows should be in one tx */
 	if (xlog_cursor_next_tx(&cursor) != 0 ||
 	    xlog_cursor_next_row(&cursor, &xrow) != 0 ||
 	    vy_run_info_decode(&xrow, key_def, &run->info, &run_id_check,
-			       &range->begin, &range->end) != 0) {
+			       &begin_check, &end_check) != 0) {
 		goto fail_close;
 	}
 	if (run_id_check != run_id) {
-		diag_set(ClientError, ER_VINYL, "Incorrect run_id: "
-			 "expected %d found %d", run_id, run_id_check);
-		goto fail_close;
+		diag_set(ClientError, ER_VINYL, "Incorrect run_id");
+		goto fail_check;
 	}
+	if (vy_range_compare_begin(range, begin_check) != 0 ||
+	    vy_range_compare_end(range, end_check) != 0) {
+		diag_set(ClientError, ER_VINYL, "Incorrect run boundaries");
+		goto fail_check;
+	}
+
+	if (begin_check != NULL)
+		vy_stmt_unref(begin_check);
+	if (end_check != NULL)
+		vy_stmt_unref(end_check);
 
 	/* Allocate buffer for page info. */
 	size_t pages_size = sizeof(struct vy_page_info) * run->info.count;
@@ -3352,19 +3188,33 @@ vy_range_recover_run(struct vy_range *range, int run_id)
 
 	/* Prepare data file for reading. */
 	vy_run_snprint_path(path, sizeof(path), index->path,
-			    key_def->opts.lsn, range->id, run_id,
-			    VY_FILE_RUN);
+			    run_id, VY_FILE_RUN);
 	run->fd = open(path, O_RDONLY);
 	if (run->fd < 0) {
 		diag_set(SystemError, "failed to open file '%s'", path);
 		goto fail;
 	}
 
-	/* Finally, link run to the range. */
-	rlist_add_entry(&range->runs, run, link);
+	/*
+	 * Finally, link run to the range.
+	 *
+	 * All runs on the list must be sorted by their age so that
+	 * newer runs are closer to the head of the list.
+	 */
+	struct vy_run *it;
+	rlist_foreach_entry(it, &range->runs, link) {
+		if (run->info.max_lsn > it->info.max_lsn)
+			break;
+	}
+	rlist_add_tail(&it->link, &run->link);
 	range->run_count++;
 	return 0;
 
+fail_check:
+	if (begin_check != NULL)
+		vy_stmt_unref(begin_check);
+	if (end_check != NULL)
+		vy_stmt_unref(end_check);
 fail_close:
 	xlog_cursor_close(&cursor, false);
 fail:
@@ -3411,6 +3261,51 @@ vy_range_delete(struct vy_range *range)
 }
 
 /*
+ * Delete the run with the given ID from a range.
+ * Return 0 on success, -1 if the run was not found.
+ */
+static int
+vy_range_delete_run_by_id(struct vy_range *range, int64_t id)
+{
+	struct vy_run *run;
+	rlist_foreach_entry(run, &range->runs, link) {
+		if (run->id == id) {
+			rlist_del_entry(run, link);
+			range->run_count--;
+			vy_run_delete(run);
+			return 0;
+		}
+	}
+	return -1;
+}
+
+/*
+ * Delete the mem with the given ID from a range.
+ * Return 0 on success, -1 if the mem was not found.
+ */
+static int
+vy_range_delete_mem_by_id(struct vy_range *range, int64_t id)
+{
+	struct vy_index *index = range->index;
+	struct vy_env *env = index->env;
+
+	struct vy_mem *mem;
+	rlist_foreach_entry(mem, &range->mems, link) {
+		if (mem->id == id) {
+			rlist_del_entry(mem, link);
+			range->mem_count--;
+			vy_scheduler_mem_dumped(env->scheduler, mem);
+			vy_quota_release(env->quota, mem->used);
+			index->used -= mem->used;
+			index->stmt_count -= mem->tree.size;
+			vy_mem_delete(mem);
+			return 0;
+		}
+	}
+	return -1;
+}
+
+/*
  * Create a new run for a range and write statements returned by a write
  * iterator to the run file until the end of the range is encountered.
  */
@@ -3430,12 +3325,10 @@ vy_range_write_run(struct vy_range *range, struct vy_write_iterator *wi,
 		     {diag_set(ClientError, ER_INJECTION,
 			       "vinyl range dump"); return -1;});
 
-	int run_id = range->run_count;
-	if (vy_run_write_data(run, index->path, range->id, run_id,
-			      wi, stmt, range->end,
+	if (vy_run_write_data(run, index->path, wi, stmt, range->end,
 			      key_def, format) != 0 ||
-	    vy_run_write_index(run, index->path, range->id, run_id,
-		               range->begin, range->end, key_def) != 0) {
+	    vy_run_write_index(run, index->path,
+			       range->begin, range->end) != 0) {
 		vy_run_delete(run);
 		return -1;
 	}
@@ -3603,236 +3496,33 @@ vy_index_create(struct vy_index *index)
 		return -1;
 	}
 
-	index->range_id_max = 0;
 	/* create initial range */
-	struct vy_range *range = vy_range_new(index, 0, NULL, NULL);
-	if (unlikely(range == NULL))
+	struct vy_range *range = vy_range_new(index, NULL, NULL);
+	if (range == NULL)
 		return -1;
 	vy_index_add_range(index, range);
-	vy_index_acct_range(index, range);
-	vy_scheduler_add_range(index->env->scheduler, range);
+
 	/* create initial mem */
 	struct vy_mem *mem = vy_mem_new(index->key_def, index->format);
 	if (mem == NULL)
 		return -1;
 	rlist_add_entry(&range->mems, mem, link);
 	range->mem_count++;
-	return 0;
-}
-
-/*
- * This structure is only needed for sorting runs for recovery.
- * Runs with higher range id go first. Runs that belong to the
- * same range are sorted by serial number in ascending order.
- * This way, we recover newer images of the same range first,
- * while within the same range runs are restored in the order
- * they were dumped.
- */
-struct vy_run_desc {
-	int64_t range_id;
-	int run_id;
-};
-
-static int
-vy_run_desc_cmp(const void *p1, const void *p2)
-{
-	const struct vy_run_desc *d1 = p1;
-	const struct vy_run_desc *d2 = p2;
-	if (d1->range_id > d2->range_id)
-		return -1;
-	if (d1->range_id < d2->range_id)
-		return 1;
-	if (d1->run_id > d2->run_id)
-		return 1;
-	if (d1->run_id < d2->run_id)
-		return -1;
-	return 0;
-}
-
-/*
- * Return list of all run files found in the index directory.
- * A run file is described by range id and run serial number.
- */
-static int
-vy_index_recover_run_list(struct vy_index *index,
-			  struct vy_run_desc **desc, int *count)
-{
-	DIR *dir = opendir(index->path);
-	if (dir == NULL) {
-		diag_set(SystemError, "failed to open directory '%s'",
-			 index->path);
-		return -1;
-	}
-
-	*desc = NULL;
-	*count = 0;
-	int cap = 0;
-
-	while (true) {
-		errno = 0;
-		struct dirent *dirent = readdir(dir);
-		if (dirent == NULL) {
-			if (errno == 0)
-				break; /* eof */
-			diag_set(SystemError, "error reading directory '%s'",
-				 index->path);
-			goto fail;
-		}
-
-		int64_t index_lsn;
-		struct vy_run_desc v;
-		enum vy_file_type t;
-
-		if (vy_run_parse_name(dirent->d_name, &index_lsn,
-				      &v.range_id, &v.run_id, &t) != 0)
-			continue; /* unknown file */
-		if (index_lsn != index->key_def->opts.lsn)
-			continue; /* different incarnation */
-		if (t != VY_FILE_INDEX)
-			continue; /* the run file */
-
-		if (*count == cap) {
-			cap = cap > 0 ? cap * 2 : 16;
-			void *p = realloc(*desc, cap * sizeof(v));
-			if (p == NULL) {
-				diag_set(OutOfMemory, cap * sizeof(v),
-					 "realloc", "struct vy_run_desc");
-				goto fail;
-			}
-			*desc = p;
-		}
-		(*desc)[(*count)++] = v;
-	}
-	closedir(dir);
-	return 0;
-fail:
-	closedir(dir);
-	free(*desc);
-	return -1;
-}
- 
-/**
- * A quick intro into Vinyl cosmology and file format
- * --------------------------------------------------
- * A single vinyl index on disk consists of a set of "range"
- * objects. A range contains a sorted set of index keys;
- * keys in different ranges do not overlap, for example:
- * [0..100],[103..252],[304..360]
- *
- * The sorted set of keys in a range is called a run. A single
- * range may contain multiple runs, each run contains changes of
- * keys in the range over a certain period of time. The periods do
- * not overlap, while, of course, two runs of the same range may
- * contain changes of the same key.
- * All keys in a run are sorted and split between pages of
- * approximately equal size. The purpose of putting keys into
- * pages is a quicker key lookup, since (min,max) key of every
- * page is put into the page index, stored at the beginning of each
- * run. The page index of an active run is fully cached in RAM.
- *
- * All files of an index have the following name pattern:
- * <lsn>.<range_id>.<run_id>.{run,index}
- * and are stored together in the index directory.
- *
- * Files that end with '.run' store metadata (see vy_run_info)
- * while '.data' files store vinyl statements.
- *
- * The <lsn> component represents LSN of index creation: it is used
- * to distinguish between different "incarnations" of the same index,
- * e.g. on create/drop events. In a most common case LSN is the
- * same for all files in an index.
- *
- * <range_id> component represents the id of the range in an
- * index. The id is a monotonically growing integer, and is
- * assigned to a range when it's created. Thus newer ranges will
- * have greater ids, and hence by recovering ranges with greater
- * ids first and ignoring ranges which are already fully spanned,
- * we can restore the whole index to its latest state.
- *
- * <run_id> is the serial number of the run in the range,
- * starting from 0.
- */
-static int
-vy_index_open_ex(struct vy_index *index)
-{
-	struct vy_run_desc *desc;
-	int count;
-	int rc = -1;
-
-	if (vy_index_recover_run_list(index, &desc, &count) != 0)
-		return -1;
 
 	/*
-	 * Always prefer newer ranges (i.e. those that have greater ids)
-	 * over older ones. Only fall back on an older range, if it has
-	 * not been spanned by the time we get to it. The latter can
-	 * only happen if there was an incomplete range split. Within
-	 * the same range, start recovery from the oldest run in order
-	 * to restore the original order of vy_range->runs list.
+	 * We can get here while bootstrapping from a remote server.
+	 * In this case we don't insert the run record into the vinyl
+	 * meta table, because we haven't received our server id yet.
+	 * We do it later, in vy_index_end_recovery().
 	 */
-	qsort(desc, count, sizeof(*desc), vy_run_desc_cmp);
-
-	struct vy_range *range = NULL;
-	for (int i = 0; i < count; i++) {
-		if (range == NULL || range->id != desc[i].range_id) {
-			/* Proceed to the next range. */
-			if (range != NULL)
-				vy_index_recover_range(index, range);
-			range = vy_range_new(index, desc[i].range_id,
-					     NULL, NULL);
-			if (range == NULL)
-				goto out;
-		}
-		if (desc[i].run_id != range->run_count) {
-			diag_set(ClientError, ER_VINYL, "run file missing");
-			return -1;
-		}
-		if (vy_range_recover_run(range, desc[i].run_id) != 0)
-			goto out;
-	}
-	if (range != NULL)
-		vy_index_recover_range(index, range);
-
-	if (index->range_count == 0) {
-		/*
-		 * Special case: index hasn't been dumped yet.
-		 * Create a range for it.
-		 */
-		range = vy_range_new(index, 0, NULL, NULL);
-		if (range == NULL)
-			goto out;
-		vy_index_add_range(index, range);
-	}
-
-	/*
-	 * Update index size and make ranges visible to the scheduler.
-	 * Also, make sure that the index does not have holes, i.e.
-	 * all data were recovered.
-	 */
-	struct vy_range *prev = NULL;
-	for (range = vy_range_tree_first(&index->tree); range != NULL;
-	     prev = range, range = vy_range_tree_next(&index->tree, range)) {
-		if ((prev == NULL && range->begin != NULL) ||
-		    (prev != NULL && !vy_range_is_adjacent(prev, range,
-							   index->key_def)))
-			break;
+	if (index->env->status == VINYL_ONLINE) {
 		vy_index_acct_range(index, range);
 		vy_scheduler_add_range(index->env->scheduler, range);
-		struct vy_mem *mem = vy_mem_new(index->key_def, index->format);
-		if (mem == NULL)
-			goto out;
-		rlist_add_entry(&range->mems, mem, link);
-		range->mem_count++;
+		if (vy_meta_insert_run(range->begin, range->end, index->key_def,
+				       VY_RUN_COMMITTED, &mem->id) != 0)
+			return -1;
 	}
-	if (range != NULL || prev->end != NULL) {
-		diag_set(ClientError, ER_VINYL, "range missing");
-		goto out;
-	}
-
-	rc = 0; /* success */
-out:
-	free(desc);
-	return rc;
+	return 0;
 }
 
 /*
@@ -3983,33 +3673,6 @@ vy_range_set_upsert(struct vy_range *range, struct vy_stmt *stmt,
 	return 0;
 }
 
-/*
- * Check if a statement was dumped to disk before the last shutdown and
- * therefore can be skipped on WAL replay.
- *
- * Since the minimal unit that can be dumped to disk is a range, a
- * statement is on disk iff its LSN is less than or equal to the max LSN
- * over all statements written to disk in the same range.
- */
-static bool
-vy_stmt_is_committed(struct vy_index *index, const struct vy_stmt *stmt)
-{
-	struct vy_range *range;
-
-	range = vy_range_tree_find_by_key(&index->tree, ITER_EQ,
-					  index->format, index->key_def, stmt);
-	if (rlist_empty(&range->runs))
-		return false;
-
-	/*
-	 * The newest run, i.e. the run containing a statement with max
-	 * LSN, is at the head of the list.
-	 */
-	struct vy_run *run = rlist_first_entry(&range->runs,
-					       struct vy_run, link);
-	return stmt->lsn <= run->info.max_lsn;
-}
-
 /**
  * Iterate over the write set of a single index
  * and flush it to the active in-memory tree of this index.
@@ -4030,6 +3693,16 @@ vy_tx_write(write_set_t *write_set, struct txv *v, ev_tstamp time,
 		struct vy_stmt *stmt = v->stmt;
 		stmt->lsn = lsn;
 
+		/* match range */
+		range = vy_range_tree_find_by_key(&index->tree, ITER_EQ,
+						  index->format, index->key_def,
+						  stmt);
+		if (range == NULL) {
+			assert(status != VINYL_ONLINE);
+			diag_set(ClientError, ER_VINYL, "run file missing");
+			assert(0); /* TODO: handle recovery error properly */
+			return NULL;
+		}
 		/**
 		 * If we're recovering the WAL, it may happen so
 		 * that this particular run was dumped after the
@@ -4038,13 +3711,10 @@ vy_tx_write(write_set_t *write_set, struct txv *v, ev_tstamp time,
 		 * In this case avoid overwriting a newer version with
 		 * an older one.
 		 */
-		if (status == VINYL_FINAL_RECOVERY &&
-		    vy_stmt_is_committed(index, stmt))
+		if (status == VINYL_FINAL_RECOVERY && range->mem_count == 0) {
+			assert(range->run_count > 0);
 			continue;
-		/* match range */
-		range = vy_range_tree_find_by_key(&index->tree, ITER_EQ,
-						  index->format, index->key_def,
-						  stmt);
+		}
 		if (prev_range != NULL && range != prev_range) {
 			/*
 			 * The write set is key-ordered, hence
@@ -4280,6 +3950,10 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range)
 	if (mem == NULL)
 		goto err_mem;
 
+	if (vy_meta_insert_run(range->begin, range->end, index->key_def,
+			       VY_RUN_COMMITTED, &mem->id) != 0)
+		goto err_meta;
+
 	/*
 	 * New insertions will go to the new in-memory tree, while we will dump
 	 * older trees. This way we don't need to bother about synchronization.
@@ -4290,9 +3964,15 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range)
 	range->version++;
 done:
 	assert(range->mem_count > 1);
+	/* The new run inherits the ID of the dumped mem. */
+	mem = rlist_entry(rlist_next(rlist_first(&range->mems)),
+			  struct vy_mem, link);
+	range->new_run->id = mem->id;
 	task->range = range;
 	say_debug("range dump prepare: %s", vy_range_str(range));
 	return task;
+err_meta:
+	vy_mem_delete(mem);
 err_mem:
 	vy_run_delete(range->new_run);
 	range->new_run = NULL;
@@ -4369,6 +4049,10 @@ vy_task_compact_complete(struct vy_task *task)
 	struct vy_range *range = task->range;
 	struct vy_range *r;
 
+	if (!index->env->is_destroying &&
+	    vy_meta_commit_compact(range) != 0)
+		return -1;
+
 	say_debug("range compact complete: %s", vy_range_str(range));
 
 	vy_index_unacct_range(index, range);
@@ -4397,6 +4081,9 @@ vy_task_compact_abort(struct vy_task *task)
 	struct vy_range *range = task->range;
 
 	say_debug("range compact failed: %s", vy_range_str(range));
+
+	if (!index->env->is_destroying)
+		vy_meta_abort_compact(range);
 
 	vy_range_discard_compact_parts(range);
 	index->version++;
@@ -4444,7 +4131,7 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 		struct vy_range *r;
 		struct vy_mem *mem;
 
-		r = parts[i] = vy_range_new(index, 0, keys[i], keys[i + 1]);
+		r = parts[i] = vy_range_new(index, keys[i], keys[i + 1]);
 		if (r == NULL)
 			goto fail;
 		r->new_run = vy_run_new();
@@ -4459,6 +4146,9 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 		if (n_parts == 1)
 			r->merge_count = range->merge_count + 1;
 	}
+
+	if (vy_meta_prepare_compact(n_parts, parts) != 0)
+		goto fail;
 
 	say_debug("range compact prepare: %s", vy_range_str(range));
 
@@ -4789,6 +4479,15 @@ vy_scheduler_f(va_list va)
 	int workers_available = scheduler->worker_pool_size;
 	bool warning_said = false;
 
+	/*
+	 * The scheduler fiber is started from the Engine::endRecovery
+	 * callback, which is invoked by box_init() before it spawns the
+	 * WAL thread. Since task creation involves inserting a record
+	 * into a memtx table, the scheduler needs the WAL thread to be
+	 * up and running, so we yield here to let box_init() finish.
+	 */
+	fiber_reschedule();
+
 	while (scheduler->is_worker_pool_running) {
 		struct stailq output_queue;
 		struct vy_task *task, *next;
@@ -5084,9 +4783,6 @@ vy_checkpoint(struct vy_env *env)
 	return 0;
 }
 
-static void
-vy_index_gc(struct vy_index *index);
-
 int
 vy_wait_checkpoint(struct vy_env *env, struct vclock *vclock)
 {
@@ -5102,101 +4798,7 @@ vy_wait_checkpoint(struct vy_env *env, struct vclock *vclock)
 		diag_add_error(diag_get(), diag_last_error(&scheduler->diag));
 		return -1;
 	}
-
-	/* Remove old run files. */
-	struct vy_index *index;
-	rlist_foreach_entry(index, &env->indexes, link)
-		vy_index_gc(index);
-
 	return 0;
-}
-
-/**
- * Unlink old ranges - i.e. ranges which are not relevant
- * any more because of a passed range split, or create/drop
- * index.
- */
-static void
-vy_index_gc(struct vy_index *index)
-{
-	ERROR_INJECT(ERRINJ_VY_GC, return);
-
-	struct mh_i32ptr_t *ranges = NULL;
-	DIR *dir = NULL;
-
-	ranges = mh_i32ptr_new();
-	if (ranges == NULL)
-		goto error;
-	/*
-	 * Construct a hash map of existing ranges, to quickly
-	 * find a valid range by range id.
-	 */
-	struct vy_range *range = vy_range_tree_first(&index->tree);
-	while (range) {
-		struct mh_i32ptr_node_t node = {range->id, range};
-		if (mh_i32ptr_put(ranges, &node, NULL, NULL) == mh_end(ranges))
-			goto error;
-		if (range->shadow != NULL) {
-			node.key = range->shadow->id;
-			node.val = range->shadow;
-			if (mh_i32ptr_put(ranges, &node, NULL, NULL) ==
-			    mh_end(ranges))
-				goto error;
-		}
-		range = vy_range_tree_next(&index->tree, range);
-	}
-	/*
-	 * Scan the index directory and unlink files not
-	 * referenced from any valid range.
-	 */
-	dir = opendir(index->path);
-	if (dir == NULL)
-		goto error;
-	struct dirent *dirent;
-	/**
-	 * @todo: only remove files matching the pattern *and*
-	 * identified as old, not all files.
-	 */
-	while ((dirent = readdir(dir))) {
-		int64_t index_lsn;
-		int64_t range_id;
-		int run_id;
-		enum vy_file_type t;
-
-		if (!(strcmp(".", dirent->d_name)))
-			continue;
-		if (!(strcmp("..", dirent->d_name)))
-			continue;
-		bool is_vinyl_file = false;
-		/*
-		 * Now we can delete in progress file, this is bad
-		if (strstr(dirent->d_name, ".tmp") == dirent->d_name) {
-			is_vinyl_file = true;
-		}
-		*/
-		if (vy_run_parse_name(dirent->d_name, &index_lsn,
-				      &range_id, &run_id, &t) == 0) {
-			is_vinyl_file = true;
-			mh_int_t range = mh_i32ptr_find(ranges, range_id, NULL);
-			if (index_lsn == index->key_def->opts.lsn &&
-			    range != mh_end(ranges))
-				continue;
-		}
-		if (!is_vinyl_file)
-			continue;
-		char path[PATH_MAX];
-		snprintf(path, PATH_MAX, "%s/%s",
-			 index->path, dirent->d_name);
-		unlink(path);
-	}
-	goto end;
-error:
-	say_syserror("failed to cleanup index directory %s", index->path);
-end:
-	if (dir != NULL)
-		closedir(dir);
-	if (ranges != NULL)
-		mh_i32ptr_delete(ranges);
 }
 
 /* Scheduler }}} */
@@ -5444,126 +5046,29 @@ vy_index_conf_create(struct vy_index *conf, struct key_def *key_def)
 	return 0;
 }
 
-/**
- * Check whether or not an index was created at the
- * given LSN.
- * @note: the index may have been dropped afterwards, and
- * we don't track this fact anywhere except the write
- * ahead log.
- *
- * @note: this function simply reports that the index
- * does not exist if it encounters a read error. It's
- * assumed that the error will be taken care of when
- * someone tries to create the index.
- */
-static bool
-vy_index_exists(struct vy_index *index, int64_t lsn)
-{
-	if (!path_exists(index->path))
-		return false;
-	DIR *dir = opendir(index->path);
-	if (!dir) {
-		return false;
-	}
-	/*
-	 * Try to find a range file with a number in name
-	 * equal to the given LSN.
-	 */
-	struct dirent *dirent;
-	while ((dirent = readdir(dir))) {
-		int64_t index_lsn;
-		int64_t range_id;
-		int run_id;
-		enum vy_file_type t;
-		if (vy_run_parse_name(dirent->d_name, &index_lsn,
-				      &range_id, &run_id, &t) == 0 &&
-		    index_lsn == lsn)
-			break;
-	}
-	closedir(dir);
-	return dirent != NULL;
-}
-
-/**
- * Detect whether we already have non-garbage index files,
- * and open an existing index if that's the case. Otherwise,
- * create a new index. Take the current recovery status into
- * account.
- */
-static int
-vy_index_open_or_create(struct vy_index *index)
-{
-	/*
-	 * TODO: don't drop/recreate index in local wal
-	 * recovery mode if all operations already done.
-	 */
-	if (index->env->status == VINYL_ONLINE) {
-		/*
-		 * The recovery is complete, simply
-		 * create a new index.
-		 */
-		return vy_index_create(index);
-	}
-	if (index->env->status == VINYL_INITIAL_RECOVERY) {
-		/*
-		 * A local or remote snapshot recovery. For
-		 * a local snapshot recovery, local checkpoint LSN
-		 * is non-zero, while for a remote one (new
-		 * replica bootstrap) it is zero. In either case
-		 * the engine is being fed rows from  system spaces.
-		 *
-		 * If this is a recovery from a non-empty local
-		 * snapshot (lsn != 0), we should have index files
-		 * nicely put on disk.
-		 *
-		 * Otherwise, the index files do not exist
-		 * locally, and we should create the index
-		 * directory from scratch.
-		 */
-		return index->env->xm->lsn ?
-			vy_index_open_ex(index) : vy_index_create(index);
-	}
-	/*
-	 * Case of a WAL replay from either a local or remote
-	 * master.
-	 * If it is a remote WAL replay, there should be no
-	 * local files for this index yet - it's just being
-	 * created.
-	 *
-	 * For a local recovery, however, the index may or may not
-	 * have any files on disk, depending on whether we dumped
-	 * any rows of this index after it had been created and
-	 * before shutdown.
-	 * Moreover, even when the index directory is not empty,
-	 * we need to be careful to not open files from the
-	 * previous incarnation of this index. Imagine the case
-	 * when the index was created, dropped, and created again
-	 * - all without a checkpoint. In this case the index
-	 * directory may contain files from the dropped index
-	 * and we need to be careful to not use them. Fortunately,
-	 * we can rely on the index LSN to check whether
-	 * the files we're looking at belong to this incarnation
-	 * of the index or not, since file names always contain
-	 * this LSN.
-	 */
-	if (vy_index_exists(index, index->key_def->opts.lsn)) {
-		/*
-		 * We found a file with LSN equal to
-		 * the index creation lsn.
-		 */
-		return vy_index_open_ex(index);
-	}
-	return vy_index_create(index);
-}
-
 int
 vy_index_open(struct vy_index *index)
 {
 	struct vy_env *env = index->env;
 	struct vy_scheduler *scheduler = env->scheduler;
 
-	if (vy_index_open_or_create(index) != 0)
-		return -1;
+	if (env->status == VINYL_ONLINE || env->is_remote_recovery) {
+		/*
+		 * If recovery finished, we simply create an index.
+		 *
+		 * In case of local recovery, the index directory
+		 * should already exist on disk and data files will
+		 * be recovered by the trigger installed on the vinyl
+		 * space.
+		 *
+		 * In case of remote recovery, there shouldn't be any
+		 * data files in the index, so we create an index
+		 * directory, which will be populated by replaying
+		 * statements from the remote snapshot or WAL.
+		 */
+		if (vy_index_create(index) != 0)
+			return -1;
+	}
 
 	vy_index_ref(index);
 	rlist_add(&env->indexes, &index->link);
@@ -6807,6 +6312,7 @@ error_conf:
 void
 vy_env_delete(struct vy_env *e)
 {
+	e->is_destroying = true;
 	ev_timer_stop(loop(), &e->quota_timer);
 	vy_scheduler_delete(e->scheduler);
 	/* TODO: tarantool doesn't delete indexes during shutdown */
@@ -6841,8 +6347,10 @@ vy_begin_initial_recovery(struct vy_env *e, struct vclock *vclock)
 	assert(e->status == VINYL_OFFLINE);
 	e->status = VINYL_INITIAL_RECOVERY;
 	if (vclock) {
+		e->is_remote_recovery = false;
 		e->xm->lsn = vclock_sum(vclock);
 	} else {
+		e->is_remote_recovery = true;
 		e->xm->lsn = 0;
 	}
 }
@@ -6854,9 +6362,103 @@ vy_begin_final_recovery(struct vy_env *e)
 	e->status = VINYL_FINAL_RECOVERY;
 }
 
-void
+static int
+vy_index_end_recovery(struct vy_index *index)
+{
+	struct vy_range *range, *prev;
+
+	for (range = vy_range_tree_first(&index->tree), prev = NULL;
+	     range != NULL;
+	     prev = range, range = vy_range_tree_next(&index->tree, range)) {
+		/* Abort incomplete split. */
+		if (range->shadow != NULL) {
+			range = range->shadow;
+			vy_range_discard_compact_parts(range);
+		}
+		/* Check that there is no holes in the range tree. */
+		if (prev == NULL && range->begin != NULL)
+			goto run_missing;
+		if (prev != NULL &&
+		    vy_range_compare_end_with_begin(prev, range->begin) != 0)
+			goto run_missing;
+		/*
+		 * When bootstrapping from a remote server, we don't
+		 * insert run records into the vinyl meta table right
+		 * upon index creation, because our server id is unknown
+		 * at the time (see vy_index_create()). We fix this up
+		 * when completing recovery.
+		 */
+		if (index->env->is_remote_recovery) {
+			struct vy_mem *mem;
+			/*
+			 * Scheduler is turned off during recovery,
+			 * so no new mems/runs could appear.
+			 */
+			assert(range->mem_count == 1);
+			assert(range->run_count == 0);
+			mem = rlist_first_entry(&range->mems,
+						struct vy_mem, link);
+			if (vy_meta_insert_run(range->begin, range->end,
+					       index->key_def, VY_RUN_COMMITTED,
+					       &mem->id) != 0)
+				return -1;
+			/*
+			 * After we're done bootstrapping from a remote
+			 * server, but before the WAL thread is started,
+			 * we issue checkpoint (see bootstrap_from_master(),
+			 * box_init()). Checkpoint implies creating a new
+			 * mem and inserting a record for it to the meta
+			 * table (see vy_task_dump_new()). This record isn't
+			 * included in the snapshot, because technically it
+			 * is inserted after checkpoint is initiated. If the
+			 * WAL is unavailable (as in case of replication),
+			 * it won't be added to the WAL either and therefore
+			 * will be lost. To cope with this, we insert a new
+			 * mem along with a meta record to each range when
+			 * finalizing a new replica - this will make
+			 * vy_task_dump_new() skip mem creation.
+			 */
+			mem = vy_mem_new(index->key_def, index->format);
+			if (mem == NULL)
+				return -1;
+			rlist_add_entry(&range->mems, mem, link);
+			range->mem_count++;
+			if (vy_meta_insert_run(range->begin, range->end,
+					       index->key_def, VY_RUN_COMMITTED,
+					       &mem->id) != 0)
+				return -1;
+		}
+		if (range->mem_count == 0) {
+			/*
+			 * Each range must always have at least one
+			 * in-memory index. If this invariant doesn't
+			 * hold when we have finished the recovery,
+			 * someone must have tampered with metadata.
+			 */
+			diag_set(ClientError, ER_VINYL, "metadata corrupted");
+			return -1;
+		}
+		/* Account range and add it to the scheduler. */
+		vy_index_acct_range(index, range);
+		vy_scheduler_add_range(index->env->scheduler, range);
+	}
+	if (prev == NULL || prev->end != NULL)
+		goto run_missing;
+	return 0;
+
+run_missing:
+	diag_set(ClientError, ER_VINYL, "run file missing");
+	return -1;
+}
+
+int
 vy_end_recovery(struct vy_env *e)
 {
+	struct vy_index *index;
+	rlist_foreach_entry(index, &e->indexes, link) {
+		if (vy_index_end_recovery(index) != 0)
+			return -1;
+	}
 	assert(e->status == VINYL_FINAL_RECOVERY);
 	e->status = VINYL_ONLINE;
 	/* enable quota */
@@ -6864,6 +6466,7 @@ vy_end_recovery(struct vy_env *e)
 	/* Start scheduler if there is at least one index */
 	if (!rlist_empty(&e->indexes))
 		vy_scheduler_start(e->scheduler);
+	return 0;
 }
 
 /** }}} Recovery */
@@ -10286,3 +9889,585 @@ vy_cursor_delete(struct vy_cursor *c)
 }
 
 /*** }}} Cursor */
+
+/*
+ * Insert a run record into the vinyl metadata table.
+ *
+ * This function allocates a unique ID for the run on success.
+ */
+static int
+vy_meta_insert_run(struct vy_stmt *begin, struct vy_stmt *end,
+		   struct key_def *key_def, enum vy_run_state state,
+		   int64_t *p_run_id)
+{
+	int64_t run_id = 0;
+	uint32_t server_id = recovery->server_id;
+
+	uint32_t key_size = 0;
+	key_size += mp_sizeof_array(1);
+	key_size += mp_sizeof_uint(server_id);
+
+	char *key = box_txn_alloc(key_size);
+	if (key == NULL) {
+		diag_set(OutOfMemory, key_size, "box_txn_alloc", "key");
+		return -1;
+	}
+
+	char *key_end = key;
+	key_end = mp_encode_array(key_end, 1);
+	key_end = mp_encode_uint(key_end, server_id);
+	assert(key + key_size == key_end);
+
+	box_tuple_t *max;
+	if (box_index_max(BOX_VINYL_ID, 0, key, key_end, &max) != 0)
+		return -1;
+	if (max != NULL) {
+		const char *data = tuple_data(max);
+		(void)mp_decode_array(&data);
+		if (mp_decode_uint(&data) == recovery->server_id)
+			run_id = mp_decode_uint(&data) + 1;
+	}
+
+	uint32_t tuple_size = 0;
+	tuple_size += mp_sizeof_array(8);
+	tuple_size += mp_sizeof_uint(server_id);
+	tuple_size += mp_sizeof_uint(run_id);
+	tuple_size += mp_sizeof_uint(key_def->space_id);
+	tuple_size += mp_sizeof_uint(key_def->iid);
+	tuple_size += mp_sizeof_uint(key_def->opts.lsn);
+	tuple_size += mp_sizeof_uint(state);
+	const char *begin_data;
+	uint32_t begin_size;
+	if (begin != NULL) {
+		begin_data = vy_key_data_range(begin, &begin_size);
+		tuple_size += begin_size;
+	} else
+		tuple_size += mp_sizeof_array(0);
+	const char *end_data;
+	uint32_t end_size;
+	if (end != NULL) {
+		end_data = vy_key_data_range(end, &end_size);
+		tuple_size += end_size;
+	} else
+		tuple_size += mp_sizeof_array(0);
+
+	char *tuple = box_txn_alloc(tuple_size);
+	if (tuple == NULL) {
+		diag_set(OutOfMemory, tuple_size, "box_txn_alloc", "tuple");
+		return -1;
+	}
+
+	char *tuple_end = tuple;
+	tuple_end = mp_encode_array(tuple_end, 8);
+	tuple_end = mp_encode_uint(tuple_end, server_id);
+	tuple_end = mp_encode_uint(tuple_end, run_id);
+	tuple_end = mp_encode_uint(tuple_end, key_def->space_id);
+	tuple_end = mp_encode_uint(tuple_end, key_def->iid);
+	tuple_end = mp_encode_uint(tuple_end, key_def->opts.lsn);
+	tuple_end = mp_encode_uint(tuple_end, state);
+	if (begin != NULL) {
+		memcpy(tuple_end, begin_data, begin_size);
+		tuple_end += begin_size;
+	} else
+		tuple_end = mp_encode_array(tuple_end, 0);
+	if (end != NULL) {
+		memcpy(tuple_end, end_data, end_size);
+		tuple_end += end_size;
+	} else
+		tuple_end = mp_encode_array(tuple_end, 0);
+	assert(tuple + tuple_size == tuple_end);
+
+	if (box_insert(BOX_VINYL_ID, tuple, tuple_end, NULL) != 0)
+		return -1;
+
+	*p_run_id = run_id;
+	return 0;
+}
+
+/*
+ * Update the state of a run in the vinyl metadata table.
+ */
+static int
+vy_meta_update_run(int64_t run_id, enum vy_run_state state)
+{
+	assert(run_id >= 0);
+	uint32_t server_id = recovery->server_id;
+
+	uint32_t key_size = 0;
+	key_size += mp_sizeof_array(2);
+	key_size += mp_sizeof_uint(server_id);
+	key_size += mp_sizeof_uint(run_id);
+
+	char *key = box_txn_alloc(key_size);
+	if (key == NULL) {
+		diag_set(OutOfMemory, key_size, "box_txn_alloc", "key");
+		return -1;
+	}
+
+	char *key_end = key;
+	key_end = mp_encode_array(key_end, 2);
+	key_end = mp_encode_uint(key_end, server_id);
+	key_end = mp_encode_uint(key_end, run_id);
+	assert(key + key_size == key_end);
+
+	uint32_t ops_size = 0;
+	ops_size += mp_sizeof_array(1);
+	ops_size += mp_sizeof_array(3);
+	ops_size += mp_sizeof_str(1);
+	ops_size += mp_sizeof_uint(5);
+	ops_size += mp_sizeof_uint(state);
+
+	char *ops = box_txn_alloc(ops_size);
+	if (ops == NULL) {
+		diag_set(OutOfMemory, key_size, "box_txn_alloc", "ops");
+		return -1;
+	}
+
+	char *ops_end = ops;
+	ops_end = mp_encode_array(ops_end, 1);
+	ops_end = mp_encode_array(ops_end, 3);
+	ops_end = mp_encode_str(ops_end, "=", 1);
+	ops_end = mp_encode_uint(ops_end, 5);
+	ops_end = mp_encode_uint(ops_end, state);
+	assert(ops + ops_size == ops_end);
+
+	return box_update(BOX_VINYL_ID, 0, key, key_end, ops, ops_end, 0, NULL);
+}
+
+/*
+ * Delete a run record from the vinyl metadata table.
+ */
+static int
+vy_meta_delete_run(int64_t run_id)
+{
+	assert(run_id >= 0);
+	uint32_t server_id = recovery->server_id;
+
+	uint32_t key_size = 0;
+	key_size += mp_sizeof_array(2);
+	key_size += mp_sizeof_uint(server_id);
+	key_size += mp_sizeof_uint(run_id);
+
+	char *key = box_txn_alloc(key_size);
+	if (key == NULL) {
+		diag_set(OutOfMemory, key_size, "box_txn_alloc", "key");
+		return -1;
+	}
+
+	char *key_end = key;
+	key_end = mp_encode_array(key_end, 2);
+	key_end = mp_encode_uint(key_end, server_id);
+	key_end = mp_encode_uint(key_end, run_id);
+	assert(key + key_size == key_end);
+
+	return box_delete(BOX_VINYL_ID, 0, key, key_end, NULL);
+}
+
+/*
+ * Reflect upcoming compaction in the vinyl metadata table.
+ *
+ * This function creates two records per each new range, one for the run
+ * which is going to be the product of compaction, another for its
+ * in-memory index. The latter is permanent - it will stay even if the
+ * compaction fails, in which case the in-memory index will be assigned
+ * to the original range. The former is transient - it only serves for
+ * reserving ID. If compaction succeeds, it will be upgraded to become
+ * permanent.
+ */
+static int
+vy_meta_prepare_compact(int n_parts, struct vy_range **parts)
+{
+	if (box_txn_begin() != 0)
+		return -1;
+	for (int i = 0; i < n_parts; i++) {
+		struct vy_range *r = parts[i];
+		struct vy_mem *mem = rlist_first_entry(&r->mems,
+						       struct vy_mem, link);
+		assert(r->new_run->id < 0);
+		if (vy_meta_insert_run(r->begin, r->end, r->index->key_def,
+				       VY_RUN_RESERVED, &r->new_run->id) != 0)
+			goto rollback;
+		assert(mem->id < 0);
+		if (vy_meta_insert_run(r->begin, r->end, r->index->key_def,
+				       VY_RUN_COMMITTED, &mem->id) != 0)
+			goto rollback;
+	}
+	if (box_txn_commit() != 0)
+		return -1;
+	return 0;
+rollback:
+	box_txn_rollback();
+	return -1;
+}
+
+/*
+ * Commit successful compaction to the vinyl metadata table.
+ *
+ * This function marks records for compacted runs as deleted and records
+ * for run-products of compaction as permanent.
+ */
+static int
+vy_meta_commit_compact(struct vy_range *range)
+{
+	if (box_txn_begin() != 0)
+		return -1;
+	struct vy_mem *mem;
+	rlist_foreach_entry(mem, &range->mems, link) {
+		if (vy_meta_update_run(mem->id, VY_RUN_DELETED) != 0)
+			goto rollback;
+	}
+	struct vy_run *run;
+	rlist_foreach_entry(run, &range->runs, link) {
+		if (vy_meta_update_run(run->id, VY_RUN_DELETED) != 0)
+			goto rollback;
+	}
+	struct vy_range *r;
+	rlist_foreach_entry(r, &range->compact_list, compact_list) {
+		if (vy_meta_update_run(r->new_run->id, VY_RUN_COMMITTED) != 0)
+			goto rollback;
+	}
+	if (box_txn_commit() != 0)
+		return -1;
+	return 0;
+rollback:
+	box_txn_rollback();
+	return -1;
+}
+
+/*
+ * Mark compaction as failed in the vinyl metadata table.
+ */
+static void
+vy_meta_abort_compact(struct vy_range *range)
+{
+	struct vy_range *r;
+	rlist_foreach_entry(r, &range->compact_list, compact_list) {
+		/*
+		 * No matter if it fails - on recovery we ignore records
+		 * that haven't been committed anyway. Marking them in a
+		 * special way is only needed for garbage collection.
+		 */
+		if (vy_meta_update_run(r->new_run->id, VY_RUN_FAILED) != 0) {
+			error_log(diag_last_error(diag_get()));
+			diag_clear(diag_get());
+		}
+	}
+}
+
+/*
+ * Given a tuple from the vinyl metadata table (run beginning or end),
+ * check its format and create a vinyl key for it.
+ */
+static int
+vy_meta_decode_key(struct key_def *key_def, struct tuple_format *format,
+		   const char *tuple, struct vy_stmt **result)
+{
+	const char *data = tuple;
+	if (mp_decode_array(&data) == 0) {
+		*result = NULL;
+		return 0;
+	}
+	if (tuple_validate_raw(format, tuple) != 0)
+		return -1;
+	struct vy_stmt *stmt = vy_stmt_extract_key_raw(tuple, IPROTO_SELECT,
+						       key_def);
+	if (stmt == NULL)
+		return -1;
+	*result = stmt;
+	return 0;
+}
+
+/*
+ * Check a run record received from the vinyl metadata table and create
+ * vinyl keys for run boundaries.
+ */
+static int
+vy_meta_decode_record(struct key_def *key_def, struct tuple_format *format,
+		      const char *begin_raw, const char *end_raw,
+		      struct vy_stmt **p_begin, struct vy_stmt **p_end)
+{
+	struct vy_stmt *begin = NULL, *end = NULL;
+	if (vy_meta_decode_key(key_def, format, begin_raw, &begin) != 0 ||
+	    vy_meta_decode_key(key_def, format, end_raw, &end) != 0)
+		goto fail;
+	if (begin != NULL && end != NULL &&
+	    vy_key_compare(begin, end, key_def) >= 0)
+		goto invalid_meta;
+	*p_begin = begin;
+	*p_end = end;
+	return 0;
+invalid_meta:
+	diag_set(ClientError, ER_VINYL, "invalid metadata");
+fail:
+	if (begin != NULL)
+		vy_stmt_unref(begin);
+	if (end != NULL)
+		vy_stmt_unref(end);
+	return -1;
+}
+
+static void
+vy_recovery_debug(struct key_def *key_def, int64_t run_id,
+		  const char *begin, const char *end, const char *msg)
+{
+	say_debug("%s: %"PRIu32"/%"PRIu32"/%"PRIi64": id %"PRIi64" %s .. %s",
+		  msg, key_def->space_id, key_def->iid, key_def->opts.lsn,
+		  run_id, vy_key_str(begin), vy_key_str(end));
+}
+
+/*
+ * Replay a vinyl metadata record inserting a new run into an index.
+ */
+int
+vy_recovery_insert_run(struct vy_index *index, int64_t id,
+		       const char *begin_raw, const char *end_raw)
+{
+	struct vy_range *range, *part;
+	int rc = -1;
+
+	vy_recovery_debug(index->key_def, id, begin_raw, end_raw, "insert run");
+
+	struct vy_stmt *begin = NULL, *end = NULL;
+	if (vy_meta_decode_record(index->key_def, index->format,
+				  begin_raw, end_raw, &begin, &end) != 0)
+		return -1;
+
+retry:
+	/* Find the range to insert this run into. */
+	range = (begin != NULL) ?
+		vy_range_tree_psearch(&index->tree, begin) :
+		vy_range_tree_first(&index->tree);
+	if (range == NULL) {
+		if (begin != NULL)
+			range = vy_range_tree_nsearch(&index->tree, begin);
+		if (range != NULL &&
+		    vy_range_compare_begin_with_end(range, end) < 0) {
+			/*
+			 * Could not happen.
+			 *
+			 *               |----range----|
+			 *   |------run------|
+			 */
+			goto fail;
+		}
+		/*
+		 * No intersection, create a new range.
+		 *
+		 *                    |------range------|
+		 *   |-----run-----|
+		 */
+		goto new_range;
+	}
+	if (range->shadow != NULL)
+		range = range->shadow;
+
+	if (vy_range_compare_end_with_begin(range, begin) <= 0) {
+		/*
+		 * No intersection, create a new range.
+		 *
+		 *   |------range------|
+		 *                          |----run----|
+		 */
+		goto new_range;
+	}
+
+	if (vy_range_compare_end(range, end) < 0) {
+		/*
+		 * Could not happen.
+		 *
+		 *      |--------range--------|
+		 *                  |------run------|
+		 */
+		goto fail;
+	}
+
+	if (!rlist_empty(&range->compact_list)) {
+		/*
+		 * The range is being split, consider adding
+		 * a new part.
+		 */
+		part = rlist_last_entry(&range->compact_list,
+					struct vy_range, compact_list);
+		assert(part->shadow == range);
+		assert(vy_range_compare_end(part, range->end) <= 0);
+		if (vy_range_compare_end(part, range->end) == 0) {
+			/*
+			 * Split is complete, but not committed. Commit
+			 * is done in vy_recovery_delete_run() when the
+			 * last item in range->runs is deleted. Hence
+			 * split was aborted.
+			 *
+			 *    |------------range------------|
+			 *                     |----part----|
+			 */
+			vy_range_discard_compact_parts(range);
+			goto retry;
+		}
+		if (vy_range_compare_end_with_begin(part, begin) != 0) {
+			/*
+			 * Could not happen.
+			 *
+			 *    |------------range------------|
+			 *    |----part----|
+			 *             |------run------|
+			 */
+			goto fail;
+		}
+		/*
+		 * Add a new part the range is going to be split into.
+		 *
+		 *    |------------range------------|
+		 *    |----part----|---run---|
+		 */
+		goto prepare_split;
+	} else {
+		if (vy_range_compare_begin(range, begin) != 0) {
+			/*
+			 * Could not happen.
+			 *
+			 *      |--------range--------|
+			 *           |----run----|
+			 */
+			goto fail;
+		}
+		if (vy_range_compare_end(range, end) == 0) {
+			/*
+			 * Add new run.
+			 *
+			 *      |--------range--------|
+			 *      |---------run---------|
+			 */
+			goto new_run;
+		}
+		/*
+		 * Initiate split.
+		 *
+		 *      |--------range--------|
+		 *      |-----run-----|
+		 */
+		goto prepare_split;
+	}
+
+prepare_split:
+	part = vy_range_new(index, begin, end);
+	if (part == NULL)
+		goto out;
+	vy_range_add_compact_part(range, part);
+	range = part;
+	goto new_run;
+new_range:
+	range = vy_range_new(index, begin, end);
+	if (range == NULL)
+		goto out;
+	vy_index_add_range(index, range);
+new_run:
+	if (vy_range_recover_run(range, id) != 0)
+		goto out;
+	rc = 0; /* success */
+out:
+	if (begin != NULL)
+		vy_stmt_unref(begin);
+	if (end != NULL)
+		vy_stmt_unref(end);
+	return rc;
+fail:
+	diag_set(ClientError, ER_VINYL,
+		 "run file missing or metadata corrupted");
+	goto out;
+}
+
+/*
+ * Replay a vinyl metadata record deleting a run from an index.
+ */
+int
+vy_recovery_delete_run(struct vy_index *index, int64_t id,
+		       const char *begin_raw, const char *end_raw)
+{
+	struct vy_range *range;
+	int rc = -1;
+
+	/* Ignore deleted runs when recovering from a snapshot. */
+	if (index->env->status == VINYL_INITIAL_RECOVERY)
+		return 0;
+
+	vy_recovery_debug(index->key_def, id, begin_raw, end_raw, "delete run");
+
+	struct vy_stmt *begin = NULL, *end = NULL;
+	if (vy_meta_decode_record(index->key_def, index->format,
+				  begin_raw, end_raw, &begin, &end) != 0)
+		return -1;
+
+	/* Find the range to delete this run from. */
+	range = (begin != NULL) ?
+		vy_range_tree_psearch(&index->tree, begin) :
+		vy_range_tree_first(&index->tree);
+	if (range == NULL)
+		goto fail;
+	if (range->shadow != NULL)
+		range = range->shadow;
+
+	if (vy_range_compare_begin(range, begin) > 0 ||
+	    vy_range_compare_end(range, end) < 0) {
+		/*
+		 * Could not happen.
+		 *
+		 *         |---------range---------|
+		 *   |--------run--------|
+		 *
+		 * or
+		 *
+		 *         |---------range---------|
+		 *                       |--------run--------|
+		 *
+		 * Deleted run must be within the range.
+		 */
+		goto fail;
+	}
+
+	if (vy_range_delete_run_by_id(range, id) != 0 &&
+	    vy_range_delete_mem_by_id(range, id) != 0)
+		goto fail; /* run not found */
+
+	/*
+	 * If the range is being split, and this is the last run
+	 * in the range, commit the split.
+	 */
+	if (range->run_count == 0 && !rlist_empty(&range->compact_list))
+		vy_range_commit_compact_parts(range);
+
+	rc = 0;
+out:
+	if (begin != NULL)
+		vy_stmt_unref(begin);
+	if (end != NULL)
+		vy_stmt_unref(end);
+	return rc;
+fail:
+	diag_set(ClientError, ER_VINYL,
+		 "run file missing or metadata corrupted");
+	goto out;
+}
+
+/*
+ * Called after successful snapshot to cleanup the index directory.
+ */
+void
+vy_index_purge_run(struct vy_index *index, int64_t run_id)
+{
+	bool fail = false;
+	/* Remove all files left from the run. */
+	for (int type = 0; type < vy_file_MAX; type++) {
+		char path[PATH_MAX];
+		vy_run_snprint_path(path, sizeof(path),
+				    index->path, run_id, type);
+		if (unlink(path) < 0 && errno != ENOENT) {
+			say_syserror("failed to delete file '%s'", path);
+			fail = true;
+		}
+	}
+	/* Delete the run record on success. */
+	if (!fail && vy_meta_delete_run(run_id) != 0) {
+		error_log(diag_last_error(diag_get()));
+		diag_clear(diag_get());
+	}
+}

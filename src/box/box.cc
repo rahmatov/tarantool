@@ -595,9 +595,17 @@ int
 box_process1(struct request *request, box_tuple_t **result)
 {
 	try {
-		/* Allow to write to temporary spaces in read-only mode. */
+		/*
+		 * In read-only mode, still allow writes to:
+		 * - Temporary spaces, because they exist exclusively
+		 *   in-memory and do not require any writes to disk.
+		 * - The space storing vinyl metadata, because we need
+		 *   to modify it for snapshot, which can be called even
+		 *   in read-only mode.
+		 */
 		struct space *space = space_cache_find(request->space_id);
-		if (!space->def.opts.temporary)
+		if (!space->def.opts.temporary &&
+		    space->def.id != BOX_VINYL_ID)
 			box_check_writable();
 		process_rw(request, space, result);
 		return 0;

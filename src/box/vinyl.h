@@ -76,7 +76,7 @@ vy_begin_initial_recovery(struct vy_env *e, struct vclock *vclock);
 void
 vy_begin_final_recovery(struct vy_env *e);
 
-void
+int
 vy_end_recovery(struct vy_env *e);
 
 int
@@ -209,6 +209,48 @@ typedef int
 (*vy_send_row_f)(void *, const char *tuple, uint32_t tuple_size, int64_t lsn);
 int
 vy_index_send(struct vy_index *index, vy_send_row_f sendrow, void *ctx);
+
+/*
+ * State of a run as recorded in the vinyl metadata table.
+ */
+enum vy_run_state {
+	/*
+	 * Run is permanent. It was created and it must be recovered.
+	 * It may or may not have a file on disk though depending on
+	 * whether it was dumped or not.
+	 */
+	VY_RUN_COMMITTED,
+	/*
+	 * Run was deleted after compaction. On snapshot its file will
+	 * be deleted and the record wiped out. When recovering from
+	 * xlog, we must "replay" the delete operation upon running into
+	 * such a record.
+	 */
+	VY_RUN_DELETED,
+	/*
+	 * Such a record is created for the new run which is going to be
+	 * the product of compaction. It serves for reserving run ID.
+	 * When compaction completes, it either becomes "committed" or
+	 * "failed" depending on whether compaction succeeded or failed.
+	 * It is ignored on recovery.
+	 */
+	VY_RUN_RESERVED,
+	/*
+	 * Run had been created for compaction which was then aborted.
+	 * The special state is needed solely for garbage collection.
+	 * It is ignored on recovery.
+	 */
+	VY_RUN_FAILED,
+};
+
+int
+vy_recovery_insert_run(struct vy_index *index, int64_t id,
+		       const char *begin, const char *end);
+int
+vy_recovery_delete_run(struct vy_index *index, int64_t id,
+		       const char *begin, const char *end);
+void
+vy_index_purge_run(struct vy_index *index, int64_t run_id);
 
 #ifdef __cplusplus
 }

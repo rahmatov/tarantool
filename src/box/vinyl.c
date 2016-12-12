@@ -127,80 +127,6 @@ struct vy_env {
 	ev_timer            quota_timer;
 };
 
-struct vy_buf {
-	/** Start of the allocated buffer */
-	char *s;
-	/** End of the used area */
-	char *p;
-	/** End of the buffer */
-	char *e;
-};
-
-static void
-vy_buf_create(struct vy_buf *b)
-{
-	b->s = NULL;
-	b->p = NULL;
-	b->e = NULL;
-}
-
-static void
-vy_buf_destroy(struct vy_buf *b)
-{
-	if (unlikely(b->s == NULL))
-		return;
-	free(b->s);
-	b->s = NULL;
-	b->p = NULL;
-	b->e = NULL;
-}
-
-static size_t
-vy_buf_size(struct vy_buf *b) {
-	return b->e - b->s;
-}
-
-static size_t
-vy_buf_used(struct vy_buf *b) {
-	return b->p - b->s;
-}
-
-static int
-vy_buf_ensure(struct vy_buf *b, size_t size)
-{
-	if (likely(b->e - b->p >= (ptrdiff_t)size))
-		return 0;
-	size_t sz = vy_buf_size(b) * 2;
-	size_t actual = vy_buf_used(b) + size;
-	if (unlikely(actual > sz))
-		sz = actual;
-	char *p;
-	if (b->s == NULL) {
-		p = malloc(sz);
-		if (unlikely(p == NULL)) {
-			diag_set(OutOfMemory, sz, "malloc", "vy_buf->p");
-			return -1;
-		}
-	} else {
-		p = realloc(b->s, sz);
-		if (unlikely(p == NULL)) {
-			diag_set(OutOfMemory, sz, "realloc", "vy_buf->p");
-			return -1;
-		}
-	}
-	b->p = p + (b->p - b->s);
-	b->e = p + sz;
-	b->s = p;
-	assert((b->e - b->p) >= (ptrdiff_t)size);
-	return 0;
-}
-
-static void
-vy_buf_advance(struct vy_buf *b, size_t size)
-{
-	b->p += size;
-}
-
 #define vy_crcs(p, size, crc) \
 	crc32_calc(crc, (char*)p + sizeof(uint32_t), size - sizeof(uint32_t))
 
@@ -595,6 +521,9 @@ vy_stmt_compare_with_key(const struct vy_stmt *stmt,
 			 const struct tuple_format *format,
 			 const struct key_def *key_def);
 
+static struct vy_stmt *
+vy_stmt_new_key(const char *key, uint32_t part_count, uint8_t type);
+
 /**
  * Create the SELECT statement from raw MessagePack data.
  * @param key MessagePack data that contain an array of fields WITHOUT the
@@ -653,6 +582,8 @@ vy_stmt_new_upsert(const char *tuple_begin, const char *tuple_end,
 		   const struct tuple_format *format,
 		   const struct key_def *key_def, struct iovec *operations,
 		   uint32_t ops_cnt);
+static void
+vy_stmt_delete(struct vy_stmt *stmt);
 
 /**
  * Apply the UPSERT statement to the REPLACE, UPSERT or DELETE statement.
@@ -749,8 +680,8 @@ vy_stmt_encode(const struct vy_stmt *value, const struct key_def *key_def,
  * @retval -1 if error
  */
 static int
-vy_stmt_decode(struct xrow_header *xrow, struct vy_buf *info_buf,
-	       struct vy_buf *data_buf, const struct tuple_format *format,
+vy_stmt_decode(struct xrow_header *xrow, struct ibuf *info_buf,
+	       struct ibuf *data_buf, const struct tuple_format *format,
 	       uint32_t part_count);
 
 /* Statement public API }}} */
@@ -1077,8 +1008,6 @@ struct vy_run_info {
 	uint64_t  total;
 	/** Pages meta. */
 	struct vy_page_info *page_infos;
-	/** Buffer with min keys of pages */
-	struct vy_buf pages_min;
 };
 
 struct vy_page_info {
@@ -1089,12 +1018,12 @@ struct vy_page_info {
 	uint32_t size;
 	/* size of page data in memory, i.e. unpacked */
 	uint32_t unpacked_size;
-	/* Offset of the min key in the parent run->pages_min. */
-	uint32_t min_key_offset;
 	/* minimal lsn of all records in page */
 	int64_t min_lsn;
 	/* maximal lsn of all records in page */
 	int64_t max_lsn;
+	/* minimal key */
+	struct vy_stmt *min_key;
 };
 
 struct vy_stmt_info {
@@ -1508,8 +1437,10 @@ struct vy_page_read_task {
 	struct vy_run *run;
 	/** vy_env - contains environment with task mempool */
 	struct vy_env *env;
-	/** [out] resulting vinyl page */
+	/** resulting vinyl page */
 	struct vy_page *page;
+	/** [out] result code */
+	int rc;
 };
 
 static struct txv *
@@ -1863,10 +1794,9 @@ vy_run_page_info(struct vy_run *run, uint32_t pos)
 }
 
 static const char *
-vy_run_page_min_key(struct vy_run *run, const struct vy_page_info *p)
+vy_run_page_min_key(const struct vy_page_info *p)
 {
-	assert(run->info.count > 0);
-	return run->info.pages_min.s + p->min_key_offset;
+	return vy_key_data(p->min_key);
 }
 
 static uint64_t
@@ -1894,7 +1824,6 @@ vy_run_new()
 		return NULL;
 	}
 	memset(&run->info, 0, sizeof(run->info));
-	vy_buf_create(&run->info.pages_min);
 	run->fd = -1;
 	run->refs = 1;
 	rlist_create(&run->link);
@@ -1906,7 +1835,9 @@ vy_run_delete(struct vy_run *run)
 {
 	if (run->fd >= 0 && close(run->fd) < 0)
 		say_syserror("close failed");
-	vy_buf_destroy(&run->info.pages_min);
+	uint32_t page_no;
+	for (page_no = 0; page_no < run->info.count; ++page_no)
+		vy_stmt_delete(run->info.page_infos[page_no].min_key);
 	free(run->info.page_infos);
 	TRASH(run);
 	free(run);
@@ -2684,25 +2615,11 @@ vy_run_write_page(struct vy_run_info *run_info, struct xlog *data_xlog,
 
 		if (first_stmt) {
 			first_stmt = false;
-			struct vy_buf *min_buf = &run_info->pages_min;
-			struct vy_stmt *min_stmt;
-			min_stmt = vy_stmt_extract_key(stmt, key_def);
-			if (min_stmt == NULL) {
+			page->min_key = vy_stmt_extract_key(stmt, key_def);
+			if (page->min_key == NULL) {
 				rc = -1;
 				goto out;
 			}
-			if (vy_buf_ensure(min_buf, min_stmt->size)) {
-				vy_stmt_unref(min_stmt);
-				rc = -1;
-				goto out;
-			}
-
-			page->min_key_offset = vy_buf_used(min_buf);
-			uint32_t bsize;
-			const char *data = vy_key_data_range(min_stmt, &bsize);
-			memcpy(min_buf->p, data, bsize);
-			vy_buf_advance(min_buf, bsize);
-			vy_stmt_unref(min_stmt);
 		}
 
 		page->unpacked_size += stmt->size;
@@ -2813,7 +2730,8 @@ err:
 
 enum vy_request_page_key {
 	VY_PAGE_REQUEST_COUNT = 1,
-	VY_PAGE_MIN_KEY = 2
+	VY_PAGE_MIN_KEY = 2,
+	VY_PAGE_DATA_SIZE = 3
 };
 
 const char *vy_page_info_key_strs[] = {
@@ -2822,14 +2740,14 @@ const char *vy_page_info_key_strs[] = {
 };
 
 const uint64_t vy_page_info_key_map = (1 << VY_PAGE_REQUEST_COUNT) |
-				      (1 << VY_PAGE_MIN_KEY);
+				      (1 << VY_PAGE_MIN_KEY) |
+				      (1 << VY_PAGE_DATA_SIZE);
 
 /**
  * Encode vy_page_info as xrow.
  * Allocates using region_alloc.
  *
  * @param page_info page information to encode
- * @param min_key the minimal key of the page
  * @param run_id run identifier
  * @param[out] xrow xrow to fill
  *
@@ -2837,7 +2755,7 @@ const uint64_t vy_page_info_key_map = (1 << VY_PAGE_REQUEST_COUNT) |
  * @retval -1 error, check diag
  */
 static int
-vy_page_info_encode(const struct vy_page_info *page_info, const char *min_key,
+vy_page_info_encode(const struct vy_page_info *page_info,
 		    int run_id, struct xrow_header *xrow)
 {
 	struct region *region = &fiber()->gc;
@@ -2847,9 +2765,8 @@ vy_page_info_encode(const struct vy_page_info *page_info, const char *min_key,
 	request.space_id = BOX_VINYL_PAGE_ID;
 	request.index_id = 0;
 
-	const char *min_key_end = min_key;
-	mp_next(&min_key_end);
-
+	uint32_t min_key_size;
+	const char *min_key = vy_key_data_range(page_info->min_key, &min_key_size);
 	/* calc tuple size */
 	uint32_t size;
 	/* 3 items run_id, page_id and map */
@@ -2858,11 +2775,13 @@ vy_page_info_encode(const struct vy_page_info *page_info, const char *min_key,
 	       mp_sizeof_uint(page_info->offset) +
 	       mp_sizeof_uint(page_info->size) +
 	       /* page map contains 2 items */
-	       mp_sizeof_map(2) +
+	       mp_sizeof_map(3) +
 	       mp_sizeof_uint(VY_PAGE_REQUEST_COUNT) +
 	       mp_sizeof_uint(page_info->count) +
 	       mp_sizeof_uint(VY_PAGE_MIN_KEY) +
-	       min_key_end - min_key;
+	       min_key_size +
+	       mp_sizeof_uint(VY_PAGE_DATA_SIZE) +
+	       mp_sizeof_uint(page_info->unpacked_size);
 
 	char *pos = region_alloc(region, size);
 	if (pos == NULL) {
@@ -2875,12 +2794,14 @@ vy_page_info_encode(const struct vy_page_info *page_info, const char *min_key,
 	pos = mp_encode_uint(pos, run_id);
 	pos = mp_encode_uint(pos, page_info->offset);
 	pos = mp_encode_uint(pos, page_info->size);
-	pos = mp_encode_map(pos, 2);
+	pos = mp_encode_map(pos, 3);
 	pos = mp_encode_uint(pos, VY_PAGE_REQUEST_COUNT);
 	pos = mp_encode_uint(pos, page_info->count);
 	pos = mp_encode_uint(pos, VY_PAGE_MIN_KEY);
-	memcpy(pos, min_key, min_key_end - min_key);
-	pos += min_key_end - min_key;
+	memcpy(pos, min_key, min_key_size);
+	pos += min_key_size;
+	pos = mp_encode_uint(pos, VY_PAGE_DATA_SIZE);
+	pos = mp_encode_uint(pos, page_info->unpacked_size);
 	request.tuple_end = pos;
 
 	memset(xrow, 0, sizeof(*xrow));
@@ -2903,7 +2824,7 @@ vy_page_info_encode(const struct vy_page_info *page_info, const char *min_key,
  */
 static int
 vy_page_info_decode(const struct xrow_header *xrow, int run_id,
-		    struct vy_page_info *page, struct vy_run_info *run_info)
+		    struct vy_page_info *page)
 {
 	struct request request;
 	/* extract all pages info */
@@ -2944,10 +2865,13 @@ vy_page_info_decode(const struct xrow_header *xrow, int run_id,
 		case VY_PAGE_MIN_KEY:
 			key_beg = pos;
 			mp_next(&pos);
-			vy_buf_ensure(&run_info->pages_min, pos - key_beg);
-			memcpy(run_info->pages_min.p, key_beg, pos - key_beg);
-			page->min_key_offset = vy_buf_used(&run_info->pages_min);
-			vy_buf_advance(&run_info->pages_min, pos - key_beg);
+			uint32_t part_count;
+			part_count = mp_decode_array(&key_beg);
+			page->min_key = vy_stmt_new_key(key_beg, part_count,
+							IPROTO_SELECT);
+			break;
+		case VY_PAGE_DATA_SIZE:
+			page->unpacked_size = mp_decode_uint(&pos);
 			break;
 		default:
 			diag_set(ClientError, ER_VINYL, "Can't decode page meta "
@@ -3127,7 +3051,6 @@ vy_run_info_decode(const struct xrow_header *xrow,
 		return -1;
 	}
 	int run_id = mp_decode_uint(&pos);
-	memset(run_info, 0, sizeof(*run_info));
 	uint64_t key_map = vy_run_info_key_map;
 	uint32_t map_size = mp_decode_map(&pos);
 	uint32_t map_item;
@@ -3226,9 +3149,8 @@ vy_run_write_index(struct vy_run *run, const char *dirpath,
 
 	for (uint32_t page_no = 0; page_no < run->info.count; ++page_no) {
 		struct vy_page_info *page_info = vy_run_page_info(run, page_no);
-		const char *min_key = vy_run_page_min_key(run, page_info);
 		struct xrow_header xrow;
-		if (vy_page_info_encode(page_info, min_key, run_id, &xrow) < 0) {
+		if (vy_page_info_encode(page_info, run_id, &xrow) < 0) {
 			goto fail;
 		}
 		if (xlog_write_row(&index_xlog, &xrow) < 0)
@@ -3342,7 +3264,7 @@ vy_range_recover_run(struct vy_range *range, int run_id)
 	uint32_t page_no = 0;
 	while ((rc = xlog_cursor_next_row(&cursor, &xrow)) == 0) {
 		struct vy_page_info *page = run->info.page_infos + page_no;
-		if (vy_page_info_decode(&xrow, run_id, page, &run->info) < 0)
+		if (vy_page_info_decode(&xrow, run_id, page) < 0)
 			goto fail_close;
 		++page_no;
 	}
@@ -3478,10 +3400,10 @@ vy_range_needs_split(struct vy_range *range, const char **p_split_key)
 	/* Find the median key in the oldest run (approximately). */
 	struct vy_page_info *mid_page;
 	mid_page = vy_run_page_info(run, run->info.count / 2);
-	const char *split_key = vy_run_page_min_key(run, mid_page);
+	const char *split_key = vy_run_page_min_key(mid_page);
 
 	struct vy_page_info *first_page = vy_run_page_info(run, 0);
-	const char *min_key = vy_run_page_min_key(run, first_page);
+	const char *min_key = vy_run_page_min_key(first_page);
 
 	/* No point in splitting if a new range is going to be empty. */
 	if (vy_key_compare_raw(min_key, split_key, key_def) == 0)
@@ -6165,18 +6087,21 @@ vy_stmt_encode(const struct vy_stmt *value, const struct key_def *key_def,
 }
 
 static int
-vy_stmt_decode(struct xrow_header *xrow, struct vy_buf *info_buf,
-	       struct vy_buf *data_buf, const struct tuple_format *format,
+vy_stmt_decode(struct xrow_header *xrow, struct ibuf *info_buf,
+	       struct ibuf *data_buf, const struct tuple_format *format,
 	       uint32_t part_count)
 {
 	struct vy_stmt_info *info;
-	if (vy_buf_ensure(info_buf, sizeof(struct vy_stmt_info)))
+	if (ibuf_unused(info_buf) < sizeof(struct vy_stmt_info)) {
+		diag_set(ClientError, ER_VINYL, "Not enough space"
+			"for stmt info decoding");
 		return -1;
-	info = (struct vy_stmt_info *)info_buf->p;
-	vy_buf_advance(info_buf, sizeof(struct vy_stmt_info));
+	}
+	info = (struct vy_stmt_info *)info_buf->wpos;
+	info_buf->wpos += sizeof(struct vy_stmt_info);
 
 	info->lsn = xrow->lsn;
-	info->offset = data_buf->p - data_buf->s;
+	info->offset = ibuf_used(data_buf);
 	struct request request;
 	request_create(&request, xrow->type);
 	if (request_decode(&request, xrow->body->iov_base,
@@ -6186,9 +6111,12 @@ vy_stmt_decode(struct xrow_header *xrow, struct vy_buf *info_buf,
 	if (info->type == IPROTO_DELETE) {
 		/* extract key */
 		info->size = request.key_end - request.key;
-		if (vy_buf_ensure(data_buf, info->size))
+		if (ibuf_unused(data_buf) < info->size) {
+			diag_set(ClientError, ER_VINYL, "Not enough space"
+				"for stmt data decoding");
 			return -1;
-		void *data = data_buf->p;
+		}
+		void *data = data_buf->wpos;
 		memcpy(data, request.key,
 		       request.key_end - request.key);
 	} else {
@@ -6200,9 +6128,11 @@ vy_stmt_decode(struct xrow_header *xrow, struct vy_buf *info_buf,
 			/* space for series count (1) and operations */
 			info->size += request.ops_end - request.ops;
 		}
-		if (vy_buf_ensure(data_buf, info->size))
+		if (ibuf_reserve(data_buf, info->size) == NULL) {
+			diag_set(OutOfMemory, info->size, "region", "page");
 			return -1;
-		void *data = data_buf->p;
+		}
+		void *data = data_buf->wpos;
 		data += start_offset;
 		/* copy tuple */
 		memcpy(data, request.tuple,
@@ -6216,7 +6146,7 @@ vy_stmt_decode(struct xrow_header *xrow, struct vy_buf *info_buf,
 			       request.ops_end - request.ops);
 		}
 	}
-	vy_buf_advance(data_buf, info->size);
+	data_buf->wpos += info->size;
 	return 0;
 }
 
@@ -7009,9 +6939,9 @@ struct vy_page {
 	/** The number of statements */
 	uint32_t count;
 	/** Tuples index array */
-	struct vy_buf info;
+	struct ibuf info;
 	/** Tuples data */
-	struct vy_buf data;
+	struct ibuf data;
 };
 
 static struct vy_page *
@@ -7024,16 +6954,28 @@ vy_page_new(const struct vy_page_info *page_info)
 		return NULL;
 	}
 	page->count = page_info->count;
-	vy_buf_create(&page->info);
-	vy_buf_create(&page->data);
+	size_t info_size = page_info->count * sizeof(struct vy_stmt_info);
+	ibuf_create(&page->info, &cord()->slabc, info_size);
+	if (ibuf_reserve(&page->info, info_size) == NULL)
+		goto error_info;
+
+	ibuf_create(&page->data, &cord()->slabc, page_info->unpacked_size);
+	if (ibuf_reserve(&page->data, page_info->unpacked_size) == NULL)
+		goto error_data;
 	return page;
+error_data:
+	ibuf_destroy(&page->data);
+error_info:
+	ibuf_destroy(&page->info);
+	free(page);
+	return NULL;
 }
 
 static void
 vy_page_delete(struct vy_page *page)
 {
-	vy_buf_destroy(&page->info);
-	vy_buf_destroy(&page->data);
+	ibuf_destroy(&page->info);
+	ibuf_destroy(&page->data);
 #if !defined(NDEBUG)
 	memset(page, '#', sizeof(*page)); /* fail early */
 #endif /* !defined(NDEBUG) */
@@ -7052,9 +6994,9 @@ vy_page_stmt(struct vy_page *page, uint32_t stmt_no,
 	     struct vy_stmt_info **pinfo)
 {
 	assert(stmt_no < page->count);
-	struct vy_stmt_info *info = (struct vy_stmt_info *)page->info.s +
+	struct vy_stmt_info *info = (struct vy_stmt_info *)page->info.rpos +
 				    stmt_no;
-	const char *stmt_data = page->data.s + info->offset;
+	const char *stmt_data = page->data.rpos + info->offset;
 	*pinfo = info;
 	return stmt_data; /* includes offset table */
 }
@@ -7131,11 +7073,11 @@ vy_run_iterator_cache_clean(struct vy_run_iterator *itr)
 /**
  * Read a page requests from vinyl xlog data file.
  *
- * @retval page on success
- * @retval NULL on error, check diag
+ * @retval 0 on success
+ * @retval -1 on error, check diag
  */
-static struct vy_page *
-vy_page_read(const struct vy_page_info *page_info, int fd,
+static int
+vy_page_read(struct vy_page *page, const struct vy_page_info *page_info, int fd,
 	     const struct tuple_format *format, uint32_t part_count,
 	     ZSTD_DStream *zdctx)
 {
@@ -7144,7 +7086,7 @@ vy_page_read(const struct vy_page_info *page_info, int fd,
 	char *data = (char *)region_alloc(&fiber()->gc, page_info->size);
 	if (data == NULL) {
 		diag_set(OutOfMemory, page_info->size, "region gc", "page");
-		return NULL;
+		return -1;
 	}
 	ssize_t readen = fio_pread(fd, data, page_info->size,
 				   page_info->offset);
@@ -7152,13 +7094,13 @@ vy_page_read(const struct vy_page_info *page_info, int fd,
 		/* TODO: report filename */
 		diag_set(SystemError, "failed to read from file");
 		region_truncate(&fiber()->gc, region_svp);
-		return NULL;
+		return -1;
 	}
 	if (readen != page_info->size) {
 		/* TODO: replace with XlogError, report filename */
 		diag_set(ClientError, ER_VINYL, "Unexpected end of file");
 		region_truncate(&fiber()->gc, region_svp);
-		return NULL;
+		return -1;
 	}
 
 	/* parse xlog tx and create cursor */
@@ -7168,13 +7110,7 @@ vy_page_read(const struct vy_page_info *page_info, int fd,
 				       data_pos + page_info->size, zdctx);
 	region_truncate(&fiber()->gc, region_svp);
 	if (rc != 0)
-		return NULL;
-
-	struct vy_page *page = vy_page_new(page_info);
-	if (page == NULL) {
-		xlog_tx_cursor_destroy(&tx_cursor);
-		return NULL;
-	}
+		return -1;
 
 	/* fetch all rows and decode */
 	struct xrow_header xrow;
@@ -7185,10 +7121,8 @@ vy_page_read(const struct vy_page_info *page_info, int fd,
 		++row_count;
 	}
 	xlog_tx_cursor_destroy(&tx_cursor);
-	if (rc < 0) {
-		vy_page_delete(page);
-		return NULL;
-	}
+	if (rc < 0)
+		return -1;
 
 	if (row_count != page_info->count) {
 		/* TODO: replace with XlogError, report filename */
@@ -7197,11 +7131,10 @@ vy_page_read(const struct vy_page_info *page_info, int fd,
 			 (long long) page_info->offset,
 			 (unsigned long) row_count,
 			 (unsigned long) page_info->count);
-		vy_page_delete(page);
-		return NULL;
+		return -1;
 	}
 
-	return page;
+	return 0;
 }
 
 /**
@@ -7233,9 +7166,9 @@ vy_page_read_cb(struct coio_task *base)
 	ZSTD_DStream *zdctx = vy_env_get_zdctx(task->env);
 	if (zdctx == NULL)
 		return -1;
-	task->page = vy_page_read(&task->page_info, task->run->fd,
-				  task->format, task->part_count, zdctx);
-	return task->page != NULL ? 0 : -1;
+	task->rc = vy_page_read(task->page, &task->page_info, task->run->fd,
+				task->format, task->part_count, zdctx);
+	return task->rc;
 }
 
 /**
@@ -7275,7 +7208,7 @@ vy_run_iterator_load_page(struct vy_run_iterator *itr, uint32_t page_no,
 
 	/* Allocate buffers */
 	struct vy_page_info *page_info = vy_run_page_info(itr->run, page_no);
-	struct vy_page *page = NULL;
+	struct vy_page *page = vy_page_new(page_info);
 
 	/* Read page data from the disk */
 	int rc;
@@ -7313,7 +7246,7 @@ vy_run_iterator_load_page(struct vy_run_iterator *itr, uint32_t page_no,
 		tuple_format_ref(task->format, 1);
 		task->part_count = index->key_def->part_count;
 		task->env = index->env;
-		task->page = NULL;
+		task->page = page;
 
 		/* Post task to coeio */
 		rc = coio_task_post(&task->base, TIMEOUT_INFINITY);
@@ -7321,7 +7254,11 @@ vy_run_iterator_load_page(struct vy_run_iterator *itr, uint32_t page_no,
 			return -1; /* timed out or cancelled */
 
 		/* task was posted to worker and finished */
-		page = task->page;
+		if (task->rc == -1) {
+			vy_page_read_cb_free(&task->base);
+			return -1;
+		}
+
 		task->page = NULL;
 		vy_page_read_cb_free(&task->base);
 
@@ -7346,13 +7283,11 @@ vy_run_iterator_load_page(struct vy_run_iterator *itr, uint32_t page_no,
 		ZSTD_DStream *zdctx = vy_env_get_zdctx(itr->index->env);
 		if (zdctx == NULL)
 			return -1;
-		page = vy_page_read(page_info, itr->run->fd, index->format,
-				    index->key_def->part_count, zdctx);
-	}
-
-	if (page == NULL) {
-		assert(!diag_is_empty(&fiber()->diag));
-		return -1;
+		if (vy_page_read(page, page_info, itr->run->fd, index->format,
+				 index->key_def->part_count, zdctx) == -1) {
+			vy_page_delete(page);
+			return -1;
+		}
 	}
 
 	/* Iterator is never used from multiple fibers */
@@ -7421,7 +7356,7 @@ vy_run_iterator_search_page(struct vy_run_iterator *itr,
 		uint32_t mid = beg + (end - beg) / 2;
 		struct vy_page_info *page_info;
 		page_info = vy_run_page_info(itr->run, mid);
-		const char *fnd_key = vy_run_page_min_key(itr->run, page_info);
+		const char *fnd_key = vy_run_page_min_key(page_info);
 		int cmp;
 		cmp = -vy_stmt_compare_with_raw_key(key, fnd_key, idx->format,
 						    idx->key_def);

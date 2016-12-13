@@ -3437,7 +3437,6 @@ vy_range_write_run(struct vy_range *range, struct vy_write_iterator *wi,
 			      key_def, format) != 0 ||
 	    vy_run_write_index(run, index->path, range->id, run_id,
 		               range->begin, range->end, key_def) != 0) {
-		vy_run_delete(run);
 		return -1;
 	}
 
